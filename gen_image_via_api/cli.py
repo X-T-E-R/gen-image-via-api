@@ -1,0 +1,1248 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+from pathlib import Path
+import re
+import sys
+import time
+from typing import Any
+
+from .config import DEFAULT_CONFIG_NAME, ConfigError, load_config, resolve_config_path, write_example_config
+from .queue import ImageQueue, JobRecord
+from .prompting import render_prompt_template
+from .service import ensure_worker, serve_forever, stop_worker, worker_status
+from .worker import Worker, run_queue
+
+
+COMMON_DIRECT_CLI_PARAMS = ("size", "aspect_ratio", "size_tier", "output_format", "background", "output_compression")
+RATIO_ALIASES = {
+    "square": "1:1",
+    "landscape": "3:2",
+    "portrait": "2:3",
+}
+SIZE_MULTIPLE = 16
+MAX_EDGE = 3840
+MAX_ASPECT_RATIO = 3
+MIN_PIXELS = 655_360
+MAX_PIXELS = 8_294_400
+
+
+def _read_prompt(prompt: str | None, prompt_file: str | None) -> str:
+    if prompt and prompt_file:
+        raise SystemExit("Use --prompt or --prompt-file, not both.")
+    if prompt_file:
+        return Path(prompt_file).read_text(encoding="utf-8").strip()
+    if prompt:
+        return prompt.strip()
+    raise SystemExit("Missing prompt. Use --prompt or --prompt-file.")
+
+
+def _parse_param(items: list[str] | None) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    for item in items or []:
+        if "=" not in item:
+            raise SystemExit(f"Invalid --param value (expected key=value): {item}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            raise SystemExit("Invalid --param: empty key")
+        try:
+            parsed: Any = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = value
+        params[key] = parsed
+    return params
+
+
+def _params_from_job_args(args: argparse.Namespace) -> dict[str, Any]:
+    params = _parse_param(getattr(args, "param", None))
+    if getattr(args, "size", None):
+        params["size"] = _normalize_image_size(str(args.size))
+    elif getattr(args, "aspect_ratio", None):
+        params["size"] = _size_from_aspect_ratio(args.aspect_ratio, getattr(args, "size_tier", "1K"))
+
+    direct_keys = (
+        "quality",
+        "background",
+        "moderation",
+        "model",
+        "action",
+        "output_compression",
+    )
+    for key in direct_keys:
+        value = getattr(args, key, None)
+        if value is not None:
+            params[key] = value
+
+    output_format = getattr(args, "output_format", None)
+    if output_format:
+        params["output_format"] = "jpeg" if output_format == "jpg" else output_format
+
+    stream = getattr(args, "stream", None)
+    if stream is not None:
+        params["stream"] = bool(stream)
+
+    return params
+
+
+def _params_for_prompt_render(config, params: dict[str, Any], count: int) -> dict[str, Any]:
+    return {
+        "size": config.defaults.size,
+        "quality": config.defaults.quality,
+        "output_format": config.defaults.output_format,
+        "moderation": config.defaults.moderation,
+        **params,
+        "n": count,
+    }
+
+
+def _render_prompt_with_template(
+    config,
+    raw_prompt: str,
+    params: dict[str, Any],
+    count: int,
+    *,
+    template_id: str | None,
+    no_template: bool = False,
+) -> str:
+    if no_template:
+        return raw_prompt
+    selected = template_id or config.defaults.prompt_template
+    if not selected:
+        return raw_prompt
+    template = config.prompt_template_map().get(selected)
+    if not template or not template.enabled:
+        raise SystemExit(f"Unknown or disabled prompt template: {selected}")
+    return render_prompt_template(
+        template.body,
+        prompt=raw_prompt,
+        params=_params_for_prompt_render(config, params, count),
+    )
+
+
+def _prompt_from_job_args(config, args: argparse.Namespace, params: dict[str, Any]) -> str:
+    prompt = _read_prompt(args.prompt, args.prompt_file)
+    return _render_prompt_with_template(
+        config,
+        prompt,
+        params,
+        int(args.count),
+        template_id=getattr(args, "prompt_template", None),
+        no_template=bool(getattr(args, "no_template", False)),
+    )
+
+
+def _size_from_aspect_ratio(value: str, tier: str) -> str:
+    return _calculate_image_size(tier, value)
+
+
+def _parse_ratio(value: str) -> tuple[float, float] | None:
+    normalized = RATIO_ALIASES.get(value.strip().lower().replace(" ", ""), value.strip().lower().replace(" ", ""))
+    for separator in (":", "x", "×"):
+        if separator in normalized:
+            left, right = normalized.split(separator, 1)
+            try:
+                width = float(left)
+                height = float(right)
+            except ValueError:
+                return None
+            if width > 0 and height > 0:
+                return width, height
+    return None
+
+
+def _round_multiple(value: float, multiple: int = SIZE_MULTIPLE) -> int:
+    return max(multiple, int(round(value / multiple)) * multiple)
+
+
+def _floor_multiple(value: float, multiple: int = SIZE_MULTIPLE) -> int:
+    return max(multiple, int(value // multiple) * multiple)
+
+
+def _ceil_multiple(value: float, multiple: int = SIZE_MULTIPLE) -> int:
+    import math
+
+    return max(multiple, int(math.ceil(value / multiple)) * multiple)
+
+
+def _normalize_dimensions(width: float, height: float) -> tuple[int, int]:
+    import math
+
+    normalized_width = _round_multiple(width)
+    normalized_height = _round_multiple(height)
+
+    for _ in range(4):
+        max_edge = max(normalized_width, normalized_height)
+        if max_edge > MAX_EDGE:
+            scale = MAX_EDGE / max_edge
+            normalized_width = _floor_multiple(normalized_width * scale)
+            normalized_height = _floor_multiple(normalized_height * scale)
+
+        if normalized_width / normalized_height > MAX_ASPECT_RATIO:
+            normalized_width = _floor_multiple(normalized_height * MAX_ASPECT_RATIO)
+        elif normalized_height / normalized_width > MAX_ASPECT_RATIO:
+            normalized_height = _floor_multiple(normalized_width * MAX_ASPECT_RATIO)
+
+        pixels = normalized_width * normalized_height
+        if pixels > MAX_PIXELS:
+            scale = math.sqrt(MAX_PIXELS / pixels)
+            normalized_width = _floor_multiple(normalized_width * scale)
+            normalized_height = _floor_multiple(normalized_height * scale)
+        elif pixels < MIN_PIXELS:
+            scale = math.sqrt(MIN_PIXELS / pixels)
+            normalized_width = _ceil_multiple(normalized_width * scale)
+            normalized_height = _ceil_multiple(normalized_height * scale)
+
+    return normalized_width, normalized_height
+
+
+def _normalize_image_size(value: str) -> str:
+    trimmed = value.strip()
+    if trimmed.lower() == "auto":
+        return "auto"
+    for separator in ("x", "X", "×"):
+        if separator in trimmed:
+            left, right = trimmed.split(separator, 1)
+            if left.strip().isdigit() and right.strip().isdigit():
+                width, height = _normalize_dimensions(float(left), float(right))
+                return f"{width}x{height}"
+    return trimmed
+
+
+def _calculate_image_size(tier: str, ratio: str) -> str:
+    parsed = _parse_ratio(ratio)
+    if not parsed:
+        raise SystemExit("Unsupported --aspect-ratio. Use values like 1:1, 4:3, 3:2, 16:9, 9:16, or 21:9.")
+    ratio_width, ratio_height = parsed
+    normalized_tier = str(tier or "1K").upper()
+    if normalized_tier not in {"1K", "2K", "4K"}:
+        raise SystemExit("--size-tier must be one of: 1K, 2K, 4K")
+
+    if ratio_width == ratio_height:
+        side = 1024 if normalized_tier == "1K" else 2048 if normalized_tier == "2K" else 3840
+        return _normalize_image_size(f"{side}x{side}")
+
+    if normalized_tier == "1K":
+        short_side = 1024
+        width = _round_multiple(short_side * ratio_width / ratio_height) if ratio_width > ratio_height else short_side
+        height = short_side if ratio_width > ratio_height else _round_multiple(short_side * ratio_height / ratio_width)
+        return f"{width}x{height}"
+
+    long_side = 2048 if normalized_tier == "2K" else 3840
+    width = long_side if ratio_width > ratio_height else _round_multiple(long_side * ratio_width / ratio_height)
+    height = _round_multiple(long_side * ratio_height / ratio_width) if ratio_width > ratio_height else long_side
+    return _normalize_image_size(f"{width}x{height}")
+
+
+def _params_from_batch_item(item: dict[str, Any]) -> dict[str, Any]:
+    params = dict(item.get("params") or {})
+    if item.get("size"):
+        params["size"] = _normalize_image_size(str(item["size"]))
+    elif item.get("aspect_ratio") or item.get("aspect-ratio"):
+        params["size"] = _size_from_aspect_ratio(
+            str(item.get("aspect_ratio") or item.get("aspect-ratio")),
+            str(item.get("size_tier") or item.get("size-tier") or "1K"),
+        )
+    for key in (
+        "quality",
+        "background",
+        "moderation",
+        "model",
+        "action",
+        "output_compression",
+        "stream",
+    ):
+        if key in item:
+            params[key] = item[key]
+    if item.get("output_format") or item.get("format"):
+        output_format = str(item.get("output_format") or item.get("format"))
+        params["output_format"] = "jpeg" if output_format == "jpg" else output_format
+    return params
+
+
+def _load_app(args: argparse.Namespace):
+    config_path = resolve_config_path(getattr(args, "config", None))
+    if not config_path.exists():
+        write_example_config(config_path, force=False)
+        raise ConfigError(
+            f"No config was found, so a template was created at {config_path}. "
+            "Fill provider keys/settings, then run `doctor` again."
+        )
+    return load_config(config_path)
+
+
+def _queue_for(config) -> ImageQueue:
+    return ImageQueue(config.queue.db)
+
+
+def _enqueue_from_args(config, args: argparse.Namespace) -> tuple[str, str, dict[str, int]]:
+    kind = "edit" if args.image else "generate"
+    params = _params_from_job_args(args)
+    prompt = _prompt_from_job_args(config, args, params)
+    queue = _queue_for(config)
+    try:
+        job_id = queue.enqueue(
+            kind=kind,
+            prompt=prompt,
+            input_images=args.image or [],
+            mask=args.mask,
+            params=params,
+            desired_count=args.count,
+            provider_id=args.provider,
+            out_dir=args.out_dir,
+            out_prefix=args.out_prefix,
+            max_attempts=args.max_attempts or config.queue.max_attempts,
+            priority=args.priority,
+        )
+        summary = queue.summary()
+    finally:
+        queue.close()
+    return job_id, kind, summary
+
+
+def _job_to_dict(queue: ImageQueue, job: JobRecord) -> dict[str, Any]:
+    return {
+        "id": job.id,
+        "kind": job.kind,
+        "status": job.status,
+        "provider_id": job.provider_id,
+        "prompt": job.prompt,
+        "input_images": job.input_images,
+        "mask": job.mask,
+        "params": job.params,
+        "desired_count": job.desired_count,
+        "out_dir": job.out_dir,
+        "out_prefix": job.out_prefix,
+        "attempts": job.attempts,
+        "max_attempts": job.max_attempts,
+        "error": job.error,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+        "finished_at": job.finished_at,
+        "queue_position": queue.queued_position(job.id),
+        "results": queue.results_for_job(job.id),
+        "events": queue.events_for_job(job.id, limit=8),
+    }
+
+
+def _result_summary(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "index": result["index"],
+        "path": result["path"],
+    }
+
+
+def _job_summary(job: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "job_id": job["id"],
+        "status": job["status"],
+        "kind": job["kind"],
+        "desired_count": job["desired_count"],
+        "provider_id": job.get("provider_id"),
+        "results": [_result_summary(item) for item in job.get("results") or []],
+    }
+    if job.get("queue_position"):
+        payload["queue_position"] = job["queue_position"]
+    if job.get("attempts"):
+        payload["attempts"] = job["attempts"]
+    if job.get("error"):
+        payload["error"] = job["error"]
+    return payload
+
+
+def _worker_summary(worker: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {"running": bool(worker.get("running"))}
+    for key in ("started", "stale"):
+        if key in worker:
+            payload[key] = bool(worker.get(key))
+    if worker.get("message"):
+        payload["message"] = worker["message"]
+    return payload
+
+
+def _submit_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "job_id": payload["job_id"],
+        "status": payload["status"],
+        "kind": payload["kind"],
+        "desired_count": payload["desired_count"],
+        "provider_id": payload["provider_id"] or payload["default_provider"] or "auto",
+        "queue_position": payload["queue_position"],
+    }
+    if payload.get("worker"):
+        summary["worker"] = _worker_summary(payload["worker"])
+    return summary
+
+
+def _batch_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "job_ids": payload["job_ids"],
+        "count": payload["count"],
+        "status": payload["status"],
+    }
+    if payload.get("worker"):
+        summary["worker"] = _worker_summary(payload["worker"])
+    return summary
+
+
+def _generate_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    summary = _job_summary(payload["job"])
+    if payload.get("timed_out"):
+        summary["timed_out"] = True
+    return summary
+
+
+def _print_json(value: Any, *, pretty: bool = False) -> None:
+    if pretty:
+        print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
+
+
+def _enabled_key_count(provider) -> int:
+    return sum(1 for key in provider.keys if key.enabled and (provider.type == "mock" or key.resolve_secret()))
+
+
+def _provider_capacity(provider) -> int:
+    if not provider.enabled:
+        return 0
+    capacity = sum(
+        max(1, int(key.max_concurrent_requests))
+        for key in provider.keys
+        if key.enabled and (provider.type == "mock" or key.resolve_secret())
+    )
+    if provider.max_concurrent_requests is not None:
+        capacity = min(capacity, max(1, int(provider.max_concurrent_requests)))
+    return max(0, capacity)
+
+
+def _is_codex_cli_like_provider(provider) -> bool:
+    return provider.codex_cli or str(provider.headers.get("originator") or provider.headers.get("Originator") or "").lower() == "codex_cli_rs"
+
+
+def _extract_template_param_refs(value: Any) -> set[str]:
+    refs: set[str] = set()
+    if isinstance(value, str):
+        refs.update(re.findall(r"\$params\.([A-Za-z_][A-Za-z0-9_]*)", value))
+    elif isinstance(value, dict):
+        for child in value.values():
+            refs.update(_extract_template_param_refs(child))
+    elif isinstance(value, list):
+        for child in value:
+            refs.update(_extract_template_param_refs(child))
+    return refs
+
+
+def _provider_parameter_support(provider) -> dict[str, Any]:
+    if provider.type == "mock":
+        return {
+            "common_cli_params": [],
+            "provider_cli_params": [],
+            "direct_cli_params": [],
+            "extra_params_via_param": [],
+            "ignored_params": [],
+            "notes": ["mock provider returns a fixed offline PNG and ignores image tuning params"],
+        }
+
+    if provider.type == "openai-images":
+        return {
+            "common_cli_params": list(COMMON_DIRECT_CLI_PARAMS),
+            "provider_cli_params": ["quality", "moderation", "model"],
+            "direct_cli_params": [*COMMON_DIRECT_CLI_PARAMS, "quality", "moderation", "model"],
+            "extra_params_via_param": ["input_fidelity", "response_format", "prompt_rewrite_guard", "append_size_to_prompt"],
+            "ignored_params": ["action", "stream"],
+            "notes": [
+                "action and stream are accepted by the CLI but ignored for Images API providers",
+                "provider.response_format_b64_json adds response_format=b64_json when the job does not set one",
+                "provider.codex_cli omits quality and prefixes the no-rewrite prompt guard",
+                "provider.append_size_to_prompt appends a size/ratio instruction to the submitted prompt",
+                "output_compression is sent only when output_format is jpeg or webp",
+                "transparent background support is model-specific and some providers may reject it",
+                "model belongs in provider config; per-job model override is also accepted with --model",
+            ],
+        }
+
+    if provider.type in {"responses-image", "any"}:
+        extras = [
+            "tool_choice",
+            "omit_tool_choice",
+            "omit_action",
+            "omit_size",
+            "omit_quality",
+            "reasoning",
+            "metadata",
+            "max_output_tokens",
+            "previous_response_id",
+            "partial_images",
+            "responses_stream_partial_images",
+            "force_responses_stream",
+            "prompt_rewrite_guard",
+            "append_size_to_prompt",
+        ]
+        notes = [
+            "moderation is not sent to the Responses image_generation tool",
+            "provider.force_responses_stream forces stream=true even if a job passes --no-stream",
+            "provider.responses_stream_partial_images adds partial_images to the image_generation tool, clamped to 0-3",
+            "provider.append_size_to_prompt appends a size/ratio instruction to the submitted prompt",
+            "output_compression is sent only when output_format is jpeg or webp",
+            "transparent background support is model-specific and some providers may reject it",
+            "omit_action/omit_size/omit_tool_choice can match minimal browser-style routers",
+        ]
+        if provider.type == "any":
+            notes.append("type=any defaults to omitting action, size, and tool_choice to match the browser sample")
+        if _is_codex_cli_like_provider(provider):
+            notes.append("quality is intentionally omitted for codex-cli-style routers")
+        return {
+            "common_cli_params": list(COMMON_DIRECT_CLI_PARAMS),
+            "provider_cli_params": ["quality", "model", "action", "stream"],
+            "direct_cli_params": [*COMMON_DIRECT_CLI_PARAMS, "quality", "model", "action", "stream"],
+            "extra_params_via_param": extras,
+            "ignored_params": ["moderation"],
+            "notes": notes,
+        }
+
+    if provider.type == "custom-http":
+        refs = sorted(
+            _extract_template_param_refs(provider.submit)
+            | _extract_template_param_refs(provider.edit_submit)
+            | _extract_template_param_refs(provider.poll)
+        )
+        direct = [param for param in COMMON_DIRECT_CLI_PARAMS if param in refs]
+        extra = [param for param in refs if param not in COMMON_DIRECT_CLI_PARAMS]
+        return {
+            "common_cli_params": direct,
+            "provider_cli_params": extra,
+            "direct_cli_params": direct,
+            "extra_params_via_param": extra,
+            "ignored_params": [],
+            "notes": [
+                "custom-http support depends on $params.* references in submit/edit/poll mappings",
+            ],
+        }
+
+    return {
+        "common_cli_params": list(COMMON_DIRECT_CLI_PARAMS),
+        "provider_cli_params": [],
+        "direct_cli_params": list(COMMON_DIRECT_CLI_PARAMS),
+        "extra_params_via_param": [],
+        "ignored_params": [],
+        "notes": [f"unknown provider type: {provider.type}"],
+    }
+
+
+def _capacity_report(config) -> dict[str, Any]:
+    providers = []
+    total = 0
+    route_total = 0
+    default_provider = config.defaults.provider
+    for provider in sorted(config.providers, key=lambda item: (item.priority, item.id)):
+        capacity = _provider_capacity(provider)
+        total += capacity
+        if default_provider is None or provider.id == default_provider:
+            route_total += capacity
+        providers.append(
+            {
+                "id": provider.id,
+                "type": provider.type,
+                "enabled": provider.enabled,
+                "priority": provider.priority,
+                "model": provider.model,
+                "base_url": provider.base_url,
+                "capabilities": list(provider.capabilities),
+                "keys_total": len(provider.keys),
+                "keys_ready": _enabled_key_count(provider),
+                "request_capacity": capacity,
+                "images_per_request": provider.images_per_request,
+                "max_concurrent_requests": provider.max_concurrent_requests,
+                "codex_cli": provider.codex_cli,
+                "response_format_b64_json": provider.response_format_b64_json,
+                "append_size_to_prompt": provider.append_size_to_prompt,
+                "force_responses_stream": provider.force_responses_stream,
+                "responses_stream_partial_images": provider.responses_stream_partial_images,
+                "parameter_support": _provider_parameter_support(provider),
+            }
+        )
+    effective_capacity = route_total if default_provider is not None else total
+    return {
+        "configured_concurrency": config.queue.concurrency,
+        "auto_capacity": total,
+        "default_provider": default_provider,
+        "route_capacity": effective_capacity,
+        "effective_worker_count": (
+            effective_capacity
+            if config.queue.concurrency <= 0
+            else min(config.queue.concurrency, max(1, effective_capacity))
+        ),
+        "providers": providers,
+    }
+
+
+def _runtime_report(config, queue: ImageQueue) -> dict[str, Any]:
+    summary = queue.summary()
+    hints = []
+    if summary.get("running", 0):
+        hints.append("There are running jobs. If no worker is active, `run` will recover them to queued before processing.")
+    return {
+        "config": str(config.path),
+        "queue_db": str(config.queue.db),
+        "output_dir": str(config.queue.output_dir),
+        "queue": summary,
+        "capacity": _capacity_report(config),
+        "worker": worker_status(config),
+        "hints": hints,
+    }
+
+
+def _print_human_submit(payload: dict[str, Any]) -> None:
+    provider = payload["provider_id"] or payload["default_provider"] or "auto"
+    print(f"Queued: {payload['job_id']} | {payload['kind']} x{payload['desired_count']} | provider={provider}")
+    print(f"Queue position: {payload['queue_position'] or 'n/a'}")
+    worker = payload.get("worker") or {}
+    if worker:
+        print(f"Worker: running={worker.get('running')} | {worker.get('message', 'unknown')}")
+    print(f"Check: python {payload['cli']} status {payload['job_id']}")
+
+
+def _print_human_job_brief(job: dict[str, Any]) -> None:
+    print(f"Job: {job['id']} | {job['status']} | {job['kind']} x{job['desired_count']}")
+    if job.get("error"):
+        print(f"Error: {job['error']}")
+    results = job.get("results") or []
+    if results:
+        print("Outputs:")
+        for item in results:
+            print(f"  [{item['index']}] {item['path']}")
+
+
+def _print_human_status(payload: dict[str, Any]) -> None:
+    if "job" in payload:
+        job = payload["job"]
+        print(f"Job: {job['id']}")
+        print(f"Status: {job['status']} | kind={job['kind']} | count={job['desired_count']} | attempts={job['attempts']}/{job['max_attempts']}")
+        print(f"Provider: {job['provider_id'] or 'default/auto'}")
+        if job.get("queue_position"):
+            print(f"Queue position: {job['queue_position']}")
+        if job.get("error"):
+            print(f"Error: {job['error']}")
+        results = job.get("results") or []
+        if results:
+            print("Outputs:")
+            for item in results:
+                print(f"  [{item['index']}] {item['path']}")
+        events = job.get("events") or []
+        if events:
+            print("Recent events:")
+            for event in events[:5]:
+                print(f"  - {event['created_at']} {event['level']}: {event['message']}")
+        return
+
+    print(f"Config: {payload['config']}")
+    print(f"Queue DB: {payload['queue_db']}")
+    print(f"Output dir: {payload['output_dir']}")
+    print(f"Queue summary: {json.dumps(payload['queue'], ensure_ascii=False, sort_keys=True)}")
+    for hint in payload.get("hints", []):
+        print(f"Hint: {hint}")
+    worker = payload.get("worker") or {}
+    if worker:
+        print(f"Worker: running={worker.get('running')} stale={worker.get('stale')} pid={worker.get('pid') or 'n/a'} log={worker.get('log_path')}")
+    cap = payload["capacity"]
+    print(
+        f"Capacity: total={cap['auto_capacity']} route={cap['route_capacity']} "
+        f"effective_workers={cap['effective_worker_count']} configured={cap['configured_concurrency']} "
+        f"default_provider={cap['default_provider'] or 'auto'}"
+    )
+    for provider in cap["providers"]:
+        state = "enabled" if provider["enabled"] else "disabled"
+        print(
+            f"  - {provider['id']}: {state} ready_keys={provider['keys_ready']}/{provider['keys_total']} "
+            f"capacity={provider['request_capacity']} type={provider['type']}"
+        )
+        support = provider.get("parameter_support") or {}
+        common = ", ".join(support.get("common_cli_params") or []) or "none"
+        provider_flags = ", ".join(support.get("provider_cli_params") or []) or "none"
+        extra = ", ".join(support.get("extra_params_via_param") or []) or "none"
+        ignored = ", ".join(support.get("ignored_params") or []) or "none"
+        print(f"    params: common={common}; provider_flags={provider_flags}; via --param={extra}; ignored={ignored}")
+        for note in support.get("notes") or []:
+            print(f"    note: {note}")
+
+
+def _print_human_run(payload: dict[str, Any]) -> None:
+    print("Run complete.")
+    print(f"Processed: {payload['result']['processed']} | succeeded={payload['result']['succeeded']} | failed={payload['result']['failed']} | workers={payload['result']['worker_count']}")
+    print(f"Before: {json.dumps(payload['before'], ensure_ascii=False, sort_keys=True)}")
+    print(f"After:  {json.dumps(payload['after'], ensure_ascii=False, sort_keys=True)}")
+    if payload.get("recent_outputs"):
+        print("Recent outputs:")
+        for item in payload["recent_outputs"]:
+            print(f"  - {item}")
+
+
+def _print_human_doctor(payload: dict[str, Any]) -> None:
+    print("Doctor:", "OK" if payload["ok"] else "ISSUES")
+    _print_human_status(payload)
+    if payload["issues"]:
+        print("Issues:")
+        for issue in payload["issues"]:
+            print(f"  - {issue}")
+
+
+def cmd_init_config(args: argparse.Namespace) -> int:
+    out = write_example_config(args.out, force=args.force)
+    print(out)
+    return 0
+
+
+def cmd_enqueue(args: argparse.Namespace) -> int:
+    config = _load_app(args)
+    job_id, kind, summary = _enqueue_from_args(config, args)
+    queue = _queue_for(config)
+    try:
+        position = queue.queued_position(job_id)
+    finally:
+        queue.close()
+    start_worker = bool(getattr(args, "start_worker", True))
+    worker = ensure_worker(config) if start_worker else {"running": False, "started": False, "message": "worker autostart skipped"}
+    payload = {
+        "job_id": job_id,
+        "status": "queued",
+        "returns_immediately": True,
+        "kind": kind,
+        "desired_count": args.count,
+        "provider_id": args.provider,
+        "default_provider": config.defaults.provider,
+        "queue_position": position,
+        "queue_summary": summary,
+        "config": str(config.path),
+        "queue_db": str(config.queue.db),
+        "capacity": _capacity_report(config),
+        "worker": worker,
+        "cli": str(Path(sys.argv[0])),
+    }
+    if args.json:
+        if getattr(args, "verbose", False):
+            _print_json(payload, pretty=True)
+        else:
+            _print_json(_submit_summary(payload))
+    else:
+        _print_human_submit(payload)
+    return 0
+
+
+def cmd_enqueue_batch(args: argparse.Namespace) -> int:
+    config = _load_app(args)
+    queue = _queue_for(config)
+    job_ids: list[str] = []
+    try:
+        for line_no, raw in enumerate(Path(args.input).read_text(encoding="utf-8").splitlines(), start=1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            item = json.loads(line)
+            prompt = str(item.get("prompt") or "").strip()
+            if not prompt:
+                raise SystemExit(f"Line {line_no}: missing prompt")
+            images = list(item.get("images") or item.get("input_images") or [])
+            kind = str(item.get("kind") or ("edit" if images else "generate"))
+            params = _params_from_batch_item(item)
+            desired_count = int(item.get("count") or item.get("desired_count") or args.count)
+            prompt = _render_prompt_with_template(
+                config,
+                prompt,
+                params,
+                desired_count,
+                template_id=item.get("prompt_template") or item.get("template") or getattr(args, "prompt_template", None),
+                no_template=bool(item.get("no_template") or getattr(args, "no_template", False)),
+            )
+            job_ids.append(
+                queue.enqueue(
+                    kind=kind,
+                    prompt=prompt,
+                    input_images=images,
+                    mask=item.get("mask"),
+                    params=params,
+                    desired_count=desired_count,
+                    provider_id=item.get("provider") or args.provider,
+                    out_dir=item.get("out_dir") or args.out_dir,
+                    out_prefix=item.get("out_prefix"),
+                    max_attempts=int(item.get("max_attempts") or args.max_attempts or config.queue.max_attempts),
+                    priority=int(item.get("priority") or 0),
+                )
+            )
+        summary = queue.summary()
+    finally:
+        queue.close()
+    start_worker = bool(getattr(args, "start_worker", True))
+    worker = ensure_worker(config) if start_worker else {"running": False, "started": False, "message": "worker autostart skipped"}
+    payload = {
+        "job_ids": job_ids,
+        "count": len(job_ids),
+        "status": "queued",
+        "returns_immediately": True,
+        "queue_summary": summary,
+        "capacity": _capacity_report(config),
+        "worker": worker,
+        "check": f"python {Path(sys.argv[0])} status",
+    }
+    if getattr(args, "verbose", False):
+        _print_json(payload, pretty=True)
+    else:
+        _print_json(_batch_summary(payload))
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    config = _load_app(args)
+    queue = _queue_for(config)
+    try:
+        before = queue.summary()
+    finally:
+        queue.close()
+    result = asyncio.run(run_queue(config, watch=args.watch, target_job_id=args.job_id))
+    queue = _queue_for(config)
+    try:
+        after = queue.summary()
+        recent_outputs = [
+            result_item["path"]
+            for job in queue.list_jobs(limit=8, status="succeeded")
+            for result_item in queue.results_for_job(job.id)
+        ][:8]
+    finally:
+        queue.close()
+    payload = {
+        "result": result,
+        "before": before,
+        "after": after,
+        "recent_outputs": recent_outputs,
+        "capacity": _capacity_report(config),
+    }
+    if args.json:
+        _print_json(payload)
+    else:
+        _print_human_run(payload)
+    return 0
+
+
+def cmd_once(args: argparse.Namespace) -> int:
+    config = _load_app(args)
+    kind = "edit" if args.image else "generate"
+    params = _params_from_job_args(args)
+    prompt = _prompt_from_job_args(config, args, params)
+    queue = _queue_for(config)
+    try:
+        job_id = queue.enqueue(
+            kind=kind,
+            prompt=prompt,
+            input_images=args.image or [],
+            mask=args.mask,
+            params=params,
+            desired_count=args.count,
+            provider_id=args.provider,
+            out_dir=args.out_dir,
+            out_prefix=args.out_prefix,
+            max_attempts=args.max_attempts or config.queue.max_attempts,
+            priority=args.priority,
+        )
+        worker = Worker(config, queue)
+        final_job = asyncio.run(worker.run_until_done(job_id))
+        full_payload = _job_to_dict(queue, final_job)
+        payload = full_payload if getattr(args, "verbose", False) else _job_summary(full_payload)
+    finally:
+        queue.close()
+    _print_json(payload, pretty=bool(getattr(args, "verbose", False)))
+    return 0 if payload["status"] == "succeeded" else 1
+
+
+def cmd_generate(args: argparse.Namespace) -> int:
+    config = _load_app(args)
+    job_id, kind, summary = _enqueue_from_args(config, args)
+    worker = ensure_worker(config)
+    if not worker.get("running"):
+        raise SystemExit(f"Worker could not be started. Check log: {worker.get('log_path')}")
+    queue = _queue_for(config)
+    try:
+        deadline = time.time() + float(args.timeout_seconds) if args.timeout_seconds else None
+        while True:
+            job = queue.get_job(job_id)
+            if job is None:
+                raise SystemExit(f"Unknown job: {job_id}")
+            if job.status in {"succeeded", "failed", "cancelled"}:
+                payload = {
+                    "job": _job_to_dict(queue, job),
+                    "status": job.status,
+                    "kind": kind,
+                    "queue_summary_at_submit": summary,
+                    "worker": worker,
+                    "runtime": _runtime_report(config, queue),
+                }
+                break
+            if deadline is not None and time.time() >= deadline:
+                payload = {
+                    "job": _job_to_dict(queue, job),
+                    "status": job.status,
+                    "timed_out": True,
+                    "worker": worker,
+                    "runtime": _runtime_report(config, queue),
+                }
+                break
+            time.sleep(max(0.1, float(args.poll_interval)))
+    finally:
+        queue.close()
+    if args.json:
+        if getattr(args, "verbose", False):
+            _print_json(payload, pretty=True)
+        else:
+            _print_json(_generate_summary(payload))
+    else:
+        if payload.get("timed_out"):
+            print(f"Timed out while waiting for job: {job_id}")
+        if getattr(args, "verbose", False):
+            _print_human_status({"job": payload["job"]})
+        else:
+            _print_human_job_brief(payload["job"])
+    return 0 if payload["status"] == "succeeded" else 1
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    config = _load_app(args)
+    queue = _queue_for(config)
+    try:
+        if args.job_id:
+            job = queue.get_job(args.job_id)
+            if not job:
+                raise SystemExit(f"Unknown job: {args.job_id}")
+            payload = {"job": _job_to_dict(queue, job), "runtime": _runtime_report(config, queue)}
+        else:
+            payload = _runtime_report(config, queue)
+    finally:
+        queue.close()
+    if args.json:
+        _print_json(payload)
+    else:
+        _print_human_status(payload)
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    config = _load_app(args)
+    queue = _queue_for(config)
+    try:
+        jobs = [_job_to_dict(queue, job) for job in queue.list_jobs(limit=args.limit, status=args.status)]
+    finally:
+        queue.close()
+    _print_json({"jobs": jobs})
+    return 0
+
+
+def cmd_retry(args: argparse.Namespace) -> int:
+    config = _load_app(args)
+    queue = _queue_for(config)
+    try:
+        changed = queue.retry(args.job_id)
+    finally:
+        queue.close()
+    _print_json({"job_id": args.job_id, "requeued": changed})
+    return 0 if changed else 1
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    config = _load_app(args)
+    queue = _queue_for(config)
+    try:
+        changed = queue.cancel(args.job_id)
+    finally:
+        queue.close()
+    _print_json({"job_id": args.job_id, "cancelled": changed})
+    return 0 if changed else 1
+
+
+def cmd_providers(args: argparse.Namespace) -> int:
+    config = _load_app(args)
+    _print_json(
+        {
+            "providers": [
+                {
+                    "id": provider.id,
+                    "type": provider.type,
+                    "enabled": provider.enabled,
+                    "priority": provider.priority,
+                    "capabilities": list(provider.capabilities),
+                    "model": provider.model,
+                    "base_url": provider.base_url,
+                    "images_per_request": provider.images_per_request,
+                    "max_concurrent_requests": provider.max_concurrent_requests,
+                    "codex_cli": provider.codex_cli,
+                    "response_format_b64_json": provider.response_format_b64_json,
+                    "append_size_to_prompt": provider.append_size_to_prompt,
+                    "force_responses_stream": provider.force_responses_stream,
+                    "responses_stream_partial_images": provider.responses_stream_partial_images,
+                    "parameter_support": _provider_parameter_support(provider),
+                    "keys": [
+                        {
+                            "id": key.id,
+                            "enabled": key.enabled,
+                            "secret": key.secret_label(),
+                            "images_per_request": key.images_per_request or provider.images_per_request,
+                            "max_concurrent_requests": key.max_concurrent_requests,
+                        }
+                        for key in provider.keys
+                    ],
+                }
+                for provider in config.providers
+            ]
+        }
+    )
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    config_path = resolve_config_path(getattr(args, "config", None))
+    if not config_path.exists():
+        created = write_example_config(config_path, force=False)
+        payload = {
+            "ok": False,
+            "needs_configuration": True,
+            "created_template": str(created),
+            "message": "Config template created. Fill provider keys/settings, then run doctor again.",
+        }
+        if args.json:
+            _print_json(payload)
+        else:
+            print("Doctor: NEEDS CONFIGURATION")
+            print(payload["message"])
+            print(f"Template: {payload['created_template']}")
+        return 1
+
+    config = load_config(config_path)
+    issues: list[str] = []
+    for provider in config.providers:
+        if not provider.enabled:
+            continue
+        if provider.type != "mock":
+            for key in provider.keys:
+                if key.enabled and not key.resolve_secret():
+                    issues.append(f"{provider.id}/{key.id}: missing secret ({key.secret_label()})")
+    queue = _queue_for(config)
+    try:
+        runtime = _runtime_report(config, queue)
+    finally:
+        queue.close()
+    payload = {
+        **runtime,
+        "providers": len(config.providers),
+        "issues": issues,
+        "ok": not issues,
+    }
+    if args.json:
+        _print_json(payload)
+    else:
+        _print_human_doctor(payload)
+    return 0 if not issues else 1
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    config = _load_app(args)
+    result = asyncio.run(serve_forever(config))
+    if args.json:
+        _print_json(result)
+    else:
+        print(result.get("message") or "Worker stopped.")
+    return 0
+
+
+def cmd_stop_worker(args: argparse.Namespace) -> int:
+    config = _load_app(args)
+    result = stop_worker(config)
+    if args.json:
+        _print_json(result)
+    else:
+        print(result.get("message") or "worker stop requested")
+    return 0 if result.get("stopped") or not result.get("running") else 1
+
+
+def add_config_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--config",
+        help="Path to TOML config. Defaults: GEN_IMAGE_CONFIG, ./gen-image.toml, then the skill directory.",
+    )
+
+
+def add_job_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--prompt")
+    parser.add_argument("--prompt-file")
+    parser.add_argument("--template", "--prompt-template", dest="prompt_template", help="Prompt template id from config")
+    parser.add_argument("--no-template", action="store_true", help="Disable the default prompt template for this job")
+    parser.add_argument("--image", action="append", help="Input image path. Repeat for multi-image edits.")
+    parser.add_argument("--mask", help="Optional mask path for edit jobs")
+    parser.add_argument("--count", type=int, default=1, help="Total images desired")
+    parser.add_argument("--provider", help="Provider id override")
+    parser.add_argument("--out-dir")
+    parser.add_argument("--out-prefix")
+    parser.add_argument("--size", help="Image size, for example 1024x1024, 1536x1024, 1024x1536, or auto")
+    parser.add_argument(
+        "--aspect-ratio",
+        help="Calculate size from ratio, for example 1:1, 4:3, 3:2, 16:9, 9:16, or 21:9",
+    )
+    parser.add_argument("--size-tier", choices=["1K", "2K", "4K"], default="1K", help="Used with --aspect-ratio")
+    parser.add_argument("--quality", choices=["auto", "low", "medium", "high"])
+    parser.add_argument("--output-format", "--format", dest="output_format", choices=["png", "jpeg", "jpg", "webp"])
+    parser.add_argument("--background", choices=["auto", "transparent", "opaque"])
+    parser.add_argument("--moderation", choices=["auto", "low"])
+    parser.add_argument("--output-compression", type=int, help="0-100 compression for jpeg/webp-capable providers")
+    parser.add_argument("--model", help="Override provider model for this job when supported")
+    parser.add_argument("--action", choices=["auto", "generate", "edit"], help="Responses image tool action when supported")
+    parser.add_argument("--stream", dest="stream", action="store_true", default=None)
+    parser.add_argument("--no-stream", dest="stream", action="store_false")
+    parser.add_argument("--param", action="append", help="Provider/API param as key=value; JSON values allowed")
+    parser.add_argument("--max-attempts", type=int)
+    parser.add_argument("--priority", type=int, default=0)
+
+
+def add_autostart_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--no-start-worker",
+        dest="start_worker",
+        action="store_false",
+        help="Only enqueue; do not auto-start the background worker.",
+    )
+    parser.set_defaults(start_worker=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="gen-image",
+        description="Async queue-backed image generation via API providers",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    init = sub.add_parser("init-config", help="Write an example TOML config")
+    init.add_argument("--out", default=DEFAULT_CONFIG_NAME)
+    init.add_argument("--force", action="store_true")
+    init.set_defaults(func=cmd_init_config)
+
+    enqueue = sub.add_parser("enqueue", help="Add one generation/edit job to the queue")
+    add_config_arg(enqueue)
+    add_job_args(enqueue)
+    add_autostart_arg(enqueue)
+    enqueue.add_argument("--json", action="store_true")
+    enqueue.add_argument("--verbose", action="store_true", help="With --json, include full diagnostics.")
+    enqueue.set_defaults(func=cmd_enqueue)
+
+    submit = sub.add_parser("submit", help="Submit one job, auto-start worker, and return immediately")
+    add_config_arg(submit)
+    add_job_args(submit)
+    add_autostart_arg(submit)
+    submit.add_argument("--json", action="store_true")
+    submit.add_argument("--verbose", action="store_true", help="With --json, include full diagnostics.")
+    submit.set_defaults(func=cmd_enqueue)
+
+    generate = sub.add_parser("generate", help="Submit one job, auto-start worker, wait, and print outputs")
+    add_config_arg(generate)
+    add_job_args(generate)
+    generate.add_argument("--json", action="store_true")
+    generate.add_argument("--verbose", action="store_true", help="Include full diagnostics instead of the compact result.")
+    generate.add_argument("--poll-interval", type=float, default=2.0)
+    generate.add_argument("--timeout-seconds", type=float, default=0.0, help="0 means wait indefinitely")
+    generate.set_defaults(func=cmd_generate)
+
+    batch = sub.add_parser("enqueue-batch", help="Add jobs from a JSONL file")
+    add_config_arg(batch)
+    batch.add_argument("--input", required=True)
+    batch.add_argument("--count", type=int, default=1)
+    batch.add_argument("--provider")
+    batch.add_argument("--out-dir")
+    batch.add_argument("--template", "--prompt-template", dest="prompt_template", help="Default prompt template id for batch items")
+    batch.add_argument("--no-template", action="store_true", help="Disable config default prompt templates for this batch")
+    batch.add_argument("--max-attempts", type=int)
+    batch.add_argument("--verbose", action="store_true", help="Include full diagnostics.")
+    add_autostart_arg(batch)
+    batch.set_defaults(func=cmd_enqueue_batch)
+
+    submit_batch = sub.add_parser("submit-batch", help="Submit jobs from JSONL, auto-start worker, and return job ids immediately")
+    add_config_arg(submit_batch)
+    submit_batch.add_argument("--input", required=True)
+    submit_batch.add_argument("--count", type=int, default=1)
+    submit_batch.add_argument("--provider")
+    submit_batch.add_argument("--out-dir")
+    submit_batch.add_argument("--template", "--prompt-template", dest="prompt_template", help="Default prompt template id for batch items")
+    submit_batch.add_argument("--no-template", action="store_true", help="Disable config default prompt templates for this batch")
+    submit_batch.add_argument("--max-attempts", type=int)
+    submit_batch.add_argument("--verbose", action="store_true", help="Include full diagnostics.")
+    add_autostart_arg(submit_batch)
+    submit_batch.set_defaults(func=cmd_enqueue_batch)
+
+    run = sub.add_parser("run", help="Run queued jobs asynchronously")
+    add_config_arg(run)
+    run.add_argument("--watch", action="store_true", help="Keep waiting for new jobs")
+    run.add_argument("--job-id", help="Only run a specific queued job")
+    run.add_argument("--json", action="store_true")
+    run.set_defaults(func=cmd_run)
+
+    once = sub.add_parser("once", help="Enqueue one job, run it, and print final JSON")
+    add_config_arg(once)
+    add_job_args(once)
+    once.add_argument("--verbose", action="store_true", help="Include full diagnostics instead of the compact result.")
+    once.set_defaults(func=cmd_once)
+
+    serve = sub.add_parser("serve", help="Run the managed background worker in the foreground")
+    add_config_arg(serve)
+    serve.add_argument("--json", action="store_true")
+    serve.set_defaults(func=cmd_serve)
+
+    worker = sub.add_parser("worker", help="Alias for serve")
+    add_config_arg(worker)
+    worker.add_argument("--json", action="store_true")
+    worker.set_defaults(func=cmd_serve)
+
+    stop_worker_cmd = sub.add_parser("stop-worker", help="Stop the managed background worker")
+    add_config_arg(stop_worker_cmd)
+    stop_worker_cmd.add_argument("--json", action="store_true")
+    stop_worker_cmd.set_defaults(func=cmd_stop_worker)
+
+    status = sub.add_parser("status", help="Show queue summary or one job")
+    add_config_arg(status)
+    status.add_argument("job_id", nargs="?")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(func=cmd_status)
+
+    list_cmd = sub.add_parser("list", help="List recent jobs")
+    add_config_arg(list_cmd)
+    list_cmd.add_argument("--limit", type=int, default=20)
+    list_cmd.add_argument("--status")
+    list_cmd.set_defaults(func=cmd_list)
+
+    retry = sub.add_parser("retry", help="Requeue a failed job")
+    add_config_arg(retry)
+    retry.add_argument("job_id")
+    retry.set_defaults(func=cmd_retry)
+
+    cancel = sub.add_parser("cancel", help="Cancel a queued/running job")
+    add_config_arg(cancel)
+    cancel.add_argument("job_id")
+    cancel.set_defaults(func=cmd_cancel)
+
+    providers = sub.add_parser("providers", help="Show configured providers and keys")
+    add_config_arg(providers)
+    providers.set_defaults(func=cmd_providers)
+
+    doctor = sub.add_parser("doctor", help="Validate config and required key env vars")
+    add_config_arg(doctor)
+    doctor.add_argument("--json", action="store_true")
+    doctor.set_defaults(func=cmd_doctor)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except ConfigError as exc:
+        print(f"Config error: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        return 130

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gen-image-via-api"
+version = "0.1.0"
+description = "Async queue-backed image generation via configurable API providers"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.27",
+]
+
+[project.scripts]
+gen-image = "gen_image_via_api.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gen_image_via_api*"]

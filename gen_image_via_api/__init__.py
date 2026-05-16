@@ -1,0 +1,5 @@
+"""Queue-backed image generation through configurable API providers."""
+
+__all__ = ["__version__"]
+
+__version__ = "0.1.0"

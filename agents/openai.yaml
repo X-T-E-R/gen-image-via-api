@@ -1,0 +1,7 @@
+interface:
+  display_name: "Gen Image Via API"
+  short_description: "Async image API queue with key rotation"
+  default_prompt: "Use $gen-image-via-api to queue image generation or image editing jobs through configured API providers."
+
+policy:
+  allow_implicit_invocation: true

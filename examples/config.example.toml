@@ -1,0 +1,130 @@
+[queue]
+db = ".gen-image-queue/queue.sqlite3"
+output_dir = "output/imagegen"
+# 0 = auto. Auto uses enabled provider/key capacity so extra jobs stay queued.
+concurrency = 0
+poll_interval_seconds = 5
+request_timeout_seconds = 180
+max_attempts = 3
+
+[defaults]
+# Empty means automatic routing across all enabled providers.
+# Set a provider id here only when every default request should be pinned.
+provider = ""
+size = "1024x1024"
+quality = "auto"
+output_format = "png"
+moderation = "auto"
+images_per_request = 1
+# Optional default prompt template id from [[prompt_templates]].
+prompt_template = ""
+
+[[prompt_templates]]
+id = "cinematic"
+name = "Cinematic wrapper"
+enabled = false
+body = "Style: cinematic, high detail.\n\n{{prompt}}\n\nRequested size: {{size}} ({{ratio}})."
+
+[[providers]]
+id = "mock-local"
+type = "mock"
+enabled = true
+priority = 1
+capabilities = ["generate", "edit"]
+images_per_request = 1
+max_concurrent_requests = 1
+codex_cli = false
+response_format_b64_json = false
+append_size_to_prompt = false
+force_responses_stream = false
+responses_stream_partial_images = 0
+
+[[providers]]
+id = "responses-router"
+type = "responses-image"
+base_url = "https://anyrouter.top/v1"
+model = "gpt-5.3-codex"
+enabled = false
+priority = 5
+capabilities = ["generate", "edit"]
+images_per_request = 1
+max_concurrent_requests = 1
+codex_cli = true
+append_size_to_prompt = false
+force_responses_stream = true
+responses_stream_partial_images = 1
+
+[providers.headers]
+User-Agent = "Mozilla/5.0"
+Origin = "null"
+
+[[providers.keys]]
+id = "responses-key-a"
+api_key_env = "RESPONSES_IMAGE_API_KEY"
+images_per_request = 1
+max_concurrent_requests = 1
+
+[[providers]]
+id = "openai-main"
+type = "openai-images"
+base_url = "https://api.openai.com/v1"
+model = "gpt-image-2"
+enabled = false
+priority = 10
+capabilities = ["generate", "edit"]
+images_per_request = 1
+max_concurrent_requests = 2
+response_format_b64_json = true
+append_size_to_prompt = false
+
+[[providers.keys]]
+id = "openai-key-a"
+api_key_env = "OPENAI_API_KEY"
+images_per_request = 1
+max_concurrent_requests = 1
+
+[[providers.keys]]
+id = "openai-key-b"
+api_key_env = "OPENAI_API_KEY_2"
+images_per_request = 1
+max_concurrent_requests = 1
+
+[[providers]]
+id = "custom-async-example"
+type = "custom-http"
+enabled = false
+priority = 20
+base_url = "https://api.example.com/v1"
+model = "example-image-model"
+capabilities = ["generate", "edit"]
+
+[[providers.keys]]
+id = "custom-key-a"
+api_key_env = "CUSTOM_IMAGE_API_KEY"
+images_per_request = 1
+max_concurrent_requests = 1
+
+[providers.submit]
+path = "images/generations"
+method = "POST"
+content_type = "json"
+task_id_path = "data.task_id"
+
+[providers.submit.body]
+model = "$model"
+prompt = "$prompt"
+size = "$params.size"
+n = "$n"
+
+[providers.poll]
+path = "tasks/{task_id}"
+method = "GET"
+interval_seconds = 5
+status_path = "data.status"
+success_values = ["completed"]
+failure_values = ["failed", "cancelled"]
+error_path = "data.error.message"
+
+[providers.poll.result]
+image_url_paths = ["data.images.*.url"]
+b64_json_paths = ["data.images.*.b64_json"]
