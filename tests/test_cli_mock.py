@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -14,12 +15,19 @@ CLI = ROOT / "scripts" / "gen_image_cli.py"
 
 
 class MockCliTests(unittest.TestCase):
-    def run_cli(self, *args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def run_cli(
+        self,
+        *args: str,
+        cwd: Path,
+        check: bool = True,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
             [sys.executable, str(CLI), *args],
             cwd=cwd,
             text=True,
             capture_output=True,
+            env={**os.environ, **(env or {})},
         )
         if check and result.returncode != 0:
             self.fail(f"CLI failed: {result.args}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
@@ -378,6 +386,109 @@ class MockCliTests(unittest.TestCase):
                 for line in (cwd / "send-log.jsonl").read_text(encoding="utf-8").splitlines()
             ]
             self.assertEqual(sent_targets, ["telegram", "weixin"])
+
+    def test_hermes_preset_uses_compatible_send_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            cwd = Path(raw)
+            hermes_agent = cwd / "hermes-agent"
+            tools = hermes_agent / "tools"
+            tools.mkdir(parents=True)
+            (tools / "__init__.py").write_text("", encoding="utf-8")
+            (tools / "send_message_tool.py").write_text(
+                "\n".join(
+                    [
+                        "import json",
+                        "from pathlib import Path",
+                        "",
+                        "def send_message_tool(args):",
+                        "    log = Path(__file__).parents[2] / 'send-log.jsonl'",
+                        "    with log.open('a', encoding='utf-8') as fh:",
+                        "        fh.write(json.dumps(args, sort_keys=True) + '\\n')",
+                        "    return json.dumps({'success': True})",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config = cwd / "gen-image.toml"
+            image = cwd / "ready.png"
+            image.write_bytes(b"image")
+            self.run_cli("init-config", "--out", str(config), cwd=cwd)
+            text = config.read_text(encoding="utf-8")
+            text = text.replace('preset = ""', 'preset = "hermes"')
+            text = text.replace("retry_delays = [2, 5, 10]", "retry_delays = []")
+            config.write_text(text, encoding="utf-8")
+
+            result = self.run_cli(
+                "send",
+                "--config",
+                str(config),
+                "--path",
+                str(image),
+                "--target",
+                "weixin",
+                "--json",
+                cwd=ROOT,
+                env={"HERMES_AGENT_PATH": str(hermes_agent), "HERMES_HOME": str(cwd)},
+            )
+
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            sent = json.loads((cwd / "send-log.jsonl").read_text(encoding="utf-8").strip())
+            self.assertEqual(sent["action"], "send")
+            self.assertEqual(sent["target"], "weixin")
+            self.assertEqual(sent["message"], f"MEDIA:{image}")
+
+    def test_openclaw_preset_accepts_env_callable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            cwd = Path(raw)
+            openclaw_root = cwd / "openclaw"
+            openclaw_root.mkdir()
+            (openclaw_root / "openclaw_sender.py").write_text(
+                "\n".join(
+                    [
+                        "import json",
+                        "from pathlib import Path",
+                        "",
+                        "def send(args):",
+                        "    log = Path(__file__).with_name('openclaw-send-log.jsonl')",
+                        "    with log.open('a', encoding='utf-8') as fh:",
+                        "        fh.write(json.dumps(args, sort_keys=True) + '\\n')",
+                        "    return {'ok': True}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config = cwd / "gen-image.toml"
+            image = cwd / "ready.png"
+            image.write_bytes(b"image")
+            self.run_cli("init-config", "--out", str(config), cwd=cwd)
+            text = config.read_text(encoding="utf-8")
+            text = text.replace('preset = ""', 'preset = "openclaw"')
+            text = text.replace("retry_delays = [2, 5, 10]", "retry_delays = []")
+            config.write_text(text, encoding="utf-8")
+
+            result = self.run_cli(
+                "send",
+                "--config",
+                str(config),
+                "--path",
+                str(image),
+                "--target",
+                "telegram",
+                "--json",
+                cwd=ROOT,
+                env={
+                    "OPENCLAW_AGENT_PATH": str(openclaw_root),
+                    "OPENCLAW_SEND_MODULE": "openclaw_sender",
+                    "OPENCLAW_SEND_FUNCTION": "send",
+                },
+            )
+
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            sent = json.loads((openclaw_root / "openclaw-send-log.jsonl").read_text(encoding="utf-8").strip())
+            self.assertEqual(sent["target"], "telegram")
+            self.assertTrue(sent["message"].startswith("MEDIA:"))
 
 
 if __name__ == "__main__":

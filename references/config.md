@@ -75,6 +75,19 @@ Unknown placeholders are left unchanged. If `{{prompt}}` is absent, the raw prom
 
 The optional `[send]` table powers `generate --send`, `once --send`, and the standalone `send` command.
 
+Preset form:
+
+```toml
+[send]
+preset = "hermes"   # or "openclaw"
+targets = ["telegram", "weixin"]
+message_template = "MEDIA:{path}"
+```
+
+The Hermes preset imports the local Hermes Agent messaging tool when `HERMES_HOME` or `HERMES_AGENT_PATH` points to an installed Hermes environment. The OpenClaw preset uses `OPENCLAW_SEND_MODULE` / `OPENCLAW_SEND_FUNCTION` or `OPENCLAW_SEND_COMMAND`, and falls back to the Hermes-compatible route when available.
+
+Explicit Python callable form:
+
 ```toml
 [send]
 method = "python-call"

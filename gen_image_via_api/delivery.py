@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import importlib
 import json
+import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import time
@@ -152,6 +154,9 @@ def _render_message(template: str, *, path: str, target: str) -> str:
 
 def _dispatch(config: AppConfig, *, path: str, target: str, message: str) -> Any:
     method = config.send.method.strip().lower()
+    preset = config.send.preset.strip().lower()
+    if preset or method in {"preset", "hermes", "openclaw"}:
+        return _dispatch_preset(config, path=path, target=target, message=message)
     if method in {"python", "python-call", "callable"}:
         return _dispatch_python(config, path=path, target=target, message=message)
     if method in {"command", "subprocess"}:
@@ -163,24 +168,12 @@ def _dispatch_python(config: AppConfig, *, path: str, target: str, message: str)
     if not config.send.module or not config.send.function:
         raise SendError("[send].module and [send].function are required for method='python-call'.")
 
-    base_dir = str(config.base_dir)
-    added_base_dir = False
-    if base_dir not in sys.path:
-        sys.path.insert(0, base_dir)
-        added_base_dir = True
-    try:
-        module = importlib.import_module(config.send.module)
-    finally:
-        if added_base_dir:
-            try:
-                sys.path.remove(base_dir)
-            except ValueError:
-                pass
+    func = _import_callable(config.send.module, config.send.function, [config.base_dir])
+    payload = _payload_for_call(config, path=path, target=target, message=message)
+    return _decode_result(func(payload))
 
-    func = getattr(module, config.send.function, None)
-    if not callable(func):
-        raise SendError(f"Configured send function is not callable: {config.send.module}.{config.send.function}")
 
+def _payload_for_call(config: AppConfig, *, path: str, target: str, message: str) -> dict[str, Any]:
     payload = dict(config.send.args)
     if config.send.action_arg:
         payload[config.send.action_arg] = config.send.action
@@ -190,25 +183,81 @@ def _dispatch_python(config: AppConfig, *, path: str, target: str, message: str)
         payload[config.send.message_arg] = message
     if config.send.path_arg:
         payload[config.send.path_arg] = path
-    return _decode_result(func(payload))
+    return payload
+
+
+def _dispatch_preset(config: AppConfig, *, path: str, target: str, message: str) -> Any:
+    preset = (config.send.preset or config.send.method).strip().lower()
+    if preset == "hermes":
+        return _dispatch_hermes_preset(config, path=path, target=target, message=message)
+    if preset == "openclaw":
+        return _dispatch_openclaw_preset(config, path=path, target=target, message=message)
+    raise SendError(f"Unsupported [send].preset: {preset}")
+
+
+def _dispatch_hermes_preset(config: AppConfig, *, path: str, target: str, message: str) -> Any:
+    roots = _candidate_hermes_agent_roots()
+    _load_hermes_environment(roots)
+    func = _import_callable("tools.send_message_tool", "send_message_tool", roots)
+    return _decode_result(func(_payload_for_call(config, path=path, target=target, message=message)))
+
+
+def _dispatch_openclaw_preset(config: AppConfig, *, path: str, target: str, message: str) -> Any:
+    env_module = os.getenv("OPENCLAW_SEND_MODULE", "").strip()
+    env_function = os.getenv("OPENCLAW_SEND_FUNCTION", "").strip()
+    roots = _candidate_openclaw_roots()
+    if env_module and env_function:
+        func = _import_callable(env_module, env_function, roots)
+        return _decode_result(func(_payload_for_call(config, path=path, target=target, message=message)))
+
+    env_command = os.getenv("OPENCLAW_SEND_COMMAND", "").strip()
+    if env_command:
+        return _run_command(
+            _format_command(_split_command(env_command), path=path, target=target, message=message),
+            cwd=config.base_dir,
+            timeout=config.send.timeout_seconds,
+        )
+
+    # OpenClaw installations do not expose one universal send callable. Hermes
+    # Agent provides a compatible messaging tool after OpenClaw migrations, so
+    # use it automatically when present.
+    try:
+        return _dispatch_hermes_preset(config, path=path, target=target, message=message)
+    except SendError as exc:
+        raise SendError(
+            "OpenClaw send preset needs OPENCLAW_SEND_MODULE/OPENCLAW_SEND_FUNCTION "
+            "or OPENCLAW_SEND_COMMAND. Hermes-compatible fallback was unavailable: "
+            f"{exc}"
+        ) from exc
 
 
 def _dispatch_command(config: AppConfig, *, path: str, target: str, message: str) -> dict[str, Any]:
     if not config.send.command:
         raise SendError("[send].command is required for method='command'.")
+    return _run_command(
+        _format_command(config.send.command, path=path, target=target, message=message),
+        cwd=config.base_dir,
+        timeout=config.send.timeout_seconds,
+    )
+
+
+def _format_command(command: tuple[str, ...] | list[str], *, path: str, target: str, message: str) -> list[str]:
     values = {
         "path": path,
         "target": target,
         "message": message,
         "filename": Path(path).name,
     }
-    argv = [item.format_map(values) for item in config.send.command]
+    return [item.format_map(values) for item in command]
+
+
+def _run_command(argv: list[str], *, cwd: Path, timeout: float) -> dict[str, Any]:
     result = subprocess.run(
         argv,
-        cwd=config.base_dir,
+        cwd=cwd,
         text=True,
         capture_output=True,
-        timeout=config.send.timeout_seconds,
+        timeout=timeout,
         check=False,
     )
     return {
@@ -217,6 +266,112 @@ def _dispatch_command(config: AppConfig, *, path: str, target: str, message: str
         "stdout": result.stdout,
         "stderr": result.stderr,
     }
+
+
+def _split_command(command: str) -> tuple[str, ...]:
+    try:
+        return tuple(shlex.split(command, posix=os.name != "nt"))
+    except ValueError as exc:
+        raise SendError(f"Invalid OPENCLAW_SEND_COMMAND: {exc}") from exc
+
+
+def _import_callable(module_name: str, function_name: str, roots: list[Path | str]) -> Any:
+    preferred_roots: list[str] = []
+    for root in roots:
+        if not root:
+            continue
+        root_path = Path(root).expanduser()
+        if not root_path.exists():
+            continue
+        root_str = str(root_path)
+        preferred_roots.append(root_str)
+    for root_str in reversed(preferred_roots):
+        if root_str not in sys.path:
+            sys.path.insert(0, root_str)
+        else:
+            sys.path.remove(root_str)
+            sys.path.insert(0, root_str)
+    if preferred_roots:
+        _purge_loaded_module(module_name)
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as exc:
+        raise SendError(f"Could not import send module {module_name!r}: {exc}") from exc
+
+    func = getattr(module, function_name, None)
+    if not callable(func):
+        raise SendError(f"Configured send function is not callable: {module_name}.{function_name}")
+    return func
+
+
+def _purge_loaded_module(module_name: str) -> None:
+    top_level = module_name.split(".", 1)[0]
+    prefixes = (top_level, f"{top_level}.")
+    for name in list(sys.modules):
+        if name == module_name or name.startswith(f"{module_name}.") or name == top_level or name.startswith(prefixes[1]):
+            sys.modules.pop(name, None)
+
+
+def _candidate_hermes_agent_roots() -> list[Path]:
+    roots: list[Path] = []
+    for env_name in ("HERMES_AGENT_PATH", "HERMES_AGENT_ROOT"):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            roots.append(Path(value).expanduser())
+    home = os.getenv("HERMES_HOME", "").strip()
+    if home:
+        roots.append(Path(home).expanduser() / "hermes-agent")
+    local_appdata = os.getenv("LOCALAPPDATA", "").strip()
+    if local_appdata:
+        roots.append(Path(local_appdata) / "hermes" / "hermes-agent")
+    roots.append(Path.home() / ".hermes" / "hermes-agent")
+    return _unique_existing_or_candidate_paths(roots)
+
+
+def _candidate_openclaw_roots() -> list[Path]:
+    roots: list[Path] = []
+    for env_name in ("OPENCLAW_AGENT_PATH", "OPENCLAW_AGENT_ROOT", "OPENCLAW_HOME", "OPENCLAW_WORKSPACE"):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            roots.append(Path(value).expanduser())
+    roots.extend(
+        [
+            Path.home() / ".openclaw" / "workspace",
+            Path.home() / ".openclaw",
+        ]
+    )
+    return _unique_existing_or_candidate_paths(roots)
+
+
+def _unique_existing_or_candidate_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    out: list[Path] = []
+    for path in paths:
+        normalized = str(path)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(path)
+    return out
+
+
+def _load_hermes_environment(roots: list[Path]) -> None:
+    hermes_home = Path(os.getenv("HERMES_HOME", "")).expanduser() if os.getenv("HERMES_HOME") else None
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            func = _import_callable("hermes_cli.env_loader", "load_hermes_dotenv", [root])
+            kwargs: dict[str, Any] = {}
+            if hermes_home:
+                kwargs["hermes_home"] = hermes_home
+            project_env = root / ".env"
+            if project_env.exists():
+                kwargs["project_env"] = project_env
+            func(**kwargs)
+            return
+        except Exception:
+            continue
 
 
 def _decode_result(result: Any) -> Any:

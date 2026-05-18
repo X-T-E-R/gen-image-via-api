@@ -70,6 +70,15 @@ python scripts/gen_image_cli.py send \
   --json
 ```
 
+For Hermes Agent delivery, configure:
+
+```toml
+[send]
+preset = "hermes"
+targets = ["telegram", "weixin"]
+message_template = "MEDIA:{path}"
+```
+
 Edit from an input image:
 
 ```bash

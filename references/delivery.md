@@ -24,6 +24,69 @@ python scripts/gen_image_cli.py send \
 
 Delivery is configured in the optional `[send]` table.
 
+## Presets
+
+### Hermes Agent
+
+Hermes Agent exposes a compatible messaging tool. When `HERMES_HOME` or `HERMES_AGENT_PATH` is set, the preset can import it automatically:
+
+```toml
+[send]
+preset = "hermes"
+targets = ["telegram", "weixin"]
+message_template = "MEDIA:{path}"
+retry_delays = [2, 5, 10]
+delay_seconds = 5
+```
+
+Then run:
+
+```bash
+python scripts/gen_image_cli.py generate \
+  --prompt "A product hero image" \
+  --send \
+  --send-target weixin \
+  --json
+```
+
+The Hermes preset sends the same payload shape as a normal Hermes messaging tool call:
+
+```json
+{
+  "action": "send",
+  "target": "weixin",
+  "message": "MEDIA:/absolute/path/to/image.png",
+  "path": "/absolute/path/to/image.png"
+}
+```
+
+### OpenClaw-Compatible
+
+OpenClaw installations do not all expose the same messaging callable. The preset supports two portable routes:
+
+```toml
+[send]
+preset = "openclaw"
+targets = ["telegram"]
+message_template = "MEDIA:{path}"
+```
+
+Route through a Python callable:
+
+```bash
+set OPENCLAW_AGENT_PATH=C:\path\to\openclaw-or-skill-root
+set OPENCLAW_SEND_MODULE=my_sender
+set OPENCLAW_SEND_FUNCTION=send
+```
+
+Or route through a command:
+
+```bash
+set OPENCLAW_SEND_COMMAND=python send_file.py --target {target} --message {message} --file {path}
+```
+
+If neither OpenClaw route is configured, the preset automatically tries the Hermes-compatible messaging tool when Hermes is installed.
+
 ### Python Callable Adapter
 
 Use this when another local package already exposes a send function. The function is called once per file/target and receives a dictionary.

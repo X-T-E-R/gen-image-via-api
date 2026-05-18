@@ -45,6 +45,7 @@ class PromptTemplateConfig:
 @dataclass(frozen=True)
 class SendConfig:
     method: str = "python-call"
+    preset: str = ""
     targets: tuple[str, ...] = ()
     default_target: str | None = None
     message_template: str = "MEDIA:{path}"
@@ -368,6 +369,7 @@ def _load_send_config(raw: Any) -> SendConfig:
         targets = (default_target,)
     return SendConfig(
         method=str(raw.get("method") or "python-call"),
+        preset=str(raw.get("preset") or ""),
         targets=targets,
         default_target=default_target,
         message_template=str(raw.get("message_template") or "MEDIA:{path}"),
@@ -504,10 +506,13 @@ body = "Style: cinematic, high detail.\\n\\n{{prompt}}\\n\\nRequested size: {{si
 
 [send]
 # Optional adapter used by `generate --send`, `once --send`, and `send`.
+# Set preset = "hermes" for Hermes Agent's messaging tool, or
+# preset = "openclaw" for OpenClaw-compatible env/command routing.
 # `python-call` imports module.function and passes one dict per file/target.
 # Use `command` for a subprocess adapter with {path}, {target}, and {message}
 # placeholders in argv items.
 method = "python-call"
+preset = ""
 module = ""
 function = ""
 targets = []

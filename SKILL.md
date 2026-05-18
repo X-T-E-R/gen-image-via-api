@@ -57,6 +57,15 @@ python scripts/gen_image_cli.py generate \
   --json
 ```
 
+Hermes Agent / OpenClaw-compatible presets:
+
+```toml
+[send]
+preset = "hermes"   # or "openclaw"
+targets = ["telegram", "weixin"]
+message_template = "MEDIA:{path}"
+```
+
 Edit or image-to-image from existing images:
 
 ```bash
