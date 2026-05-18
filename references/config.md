@@ -79,12 +79,39 @@ Preset form:
 
 ```toml
 [send]
-preset = "hermes"   # or "openclaw"
+preset = "hermes"
 targets = ["telegram", "weixin"]
 message_template = "MEDIA:{path}"
 ```
 
-The Hermes preset imports the local Hermes Agent messaging tool when `HERMES_HOME` or `HERMES_AGENT_PATH` points to an installed Hermes environment. The OpenClaw preset uses `OPENCLAW_SEND_MODULE` / `OPENCLAW_SEND_FUNCTION` or `OPENCLAW_SEND_COMMAND`, and falls back to the Hermes-compatible route when available.
+The Hermes preset imports the local Hermes Agent messaging tool when `HERMES_HOME` or `HERMES_AGENT_PATH` points to an installed Hermes environment.
+
+The OpenClaw preset uses, in order:
+
+1. `[send.openclaw].module` / `[send.openclaw].function`, or `OPENCLAW_SEND_MODULE` / `OPENCLAW_SEND_FUNCTION`, for custom Python adapters.
+2. `[send.openclaw].command`, or `OPENCLAW_SEND_COMMAND`, for a custom command.
+3. OpenClaw's native CLI route: `openclaw message send --target <target> --media <path> --json`.
+
+When the native route is used, set the OpenClaw channel with `[send.args].channel`
+or `OPENCLAW_SEND_CHANNEL` unless your OpenClaw config has exactly one usable
+message channel. `targets` should be OpenClaw message targets such as a Telegram
+chat id/username, Slack channel id, or Teams conversation id.
+
+```toml
+[send]
+preset = "openclaw"
+targets = ["@mychat"]
+message_template = "Generated {filename}\nMEDIA:{path}"
+
+[send.args]
+channel = "telegram"
+# openclaw_cli = "openclaw"
+# force_document = true
+```
+
+OpenClaw's MCP `messages_send` tool is text-only for an existing conversation
+route, so it is not used as the media delivery preset. Use `preset = "hermes"`
+explicitly if Hermes Agent is the intended destination.
 
 Explicit Python callable form:
 
@@ -116,6 +143,9 @@ command = ["python", "send_file.py", "--target", "{target}", "--message", "{mess
 targets = ["telegram"]
 ```
 
+Command entries also support `{caption}` / `{message_without_media}`, which is
+the rendered `message_template` after removing `MEDIA:{path}`.
+
 See `references/delivery.md` for examples and return handling.
 
 ## Provider Fields
@@ -144,6 +174,8 @@ Supported first-version provider types:
 - `responses-image`: OpenAI-compatible `/responses` with `image_generation` tool; supports stream/SSE-style routers like the provided HTML example.
 - `any`: browser-style `/responses` image router compatible with the provided any HTML sample. It behaves like `responses-image`, but omits `action`, `size`, and `tool_choice` by default.
 - `custom-http`: configurable submit/poll/result mapping for sync or async HTTP providers.
+- `nai`: NovelAI-compatible image provider. It posts to `{base_url}/ai/generate-image` and extracts images from the returned zip payload.
+- `idlecloud`: IdleCloud image job provider. It posts to `{base_url}/generate_image`, polls `{base_url}/get_result/{job_id}`, and reads `image_base64` or `image_url`.
 
 Provider compatibility switches:
 
@@ -239,6 +271,84 @@ For this provider:
   `[providers.params]`, or pass them with repeated `--param`, when a router rejects or
   ignores those fields.
 - For the any browser sample, prefer `type = "any"` instead of repeating those params.
+
+
+## NAI-Compatible Provider
+
+Use `type = "nai"` for NovelAI-compatible image endpoints such as IdleCloud's `/api/ai/generate-image` adapter.
+
+```toml
+[[providers]]
+id = "nai-idlecloud"
+type = "nai"
+base_url = "https://api.idlecloud.cc/api"
+model = "nai-diffusion-4-5-full"
+enabled = true
+priority = 16
+capabilities = ["generate", "edit"]
+images_per_request = 1
+max_concurrent_requests = 1
+
+[providers.params]
+negative_prompt = "lowres, bad anatomy"
+steps = 28
+scale = 5
+sampler = "k_euler"
+noise_schedule = "karras"
+ucPreset = 1
+
+[[providers.keys]]
+id = "nai-key"
+api_key_env = "IDLECLOUD_API_KEY"
+```
+
+For this provider:
+
+- `--prompt` maps to the NAI `prompt` field.
+- `--size` / `--aspect-ratio` maps to `parameters.width` and `parameters.height`.
+- `--image` maps the first input image to `parameters.image` for image-to-image/edit jobs.
+- `--mask` maps to `parameters.mask` for inpaint-style jobs.
+- Use `--param` or `[providers.params]` for NAI-specific knobs such as `negative_prompt`, `seed`, `steps`, `scale`, `sampler`, `noise_schedule`, `ucPreset`, `strength`, and `noise`.
+- The response is expected to be a zip or image payload. Zip files are unpacked and image files inside the archive are normalized into job results.
+
+## IdleCloud Provider
+
+Use `type = "idlecloud"` for IdleCloud's native async image job endpoint.
+
+```toml
+[[providers]]
+id = "idlecloud"
+type = "idlecloud"
+base_url = "https://api.idlecloud.cc/api"
+model = "nai-diffusion-4-5-full"
+enabled = true
+priority = 15
+capabilities = ["generate", "edit"]
+images_per_request = 1
+max_concurrent_requests = 1
+
+[providers.params]
+negativePrompt = "lowres, bad anatomy"
+steps = 28
+scale = 5
+sampler = "k_euler"
+noise_schedule = "karras"
+ucPreset = 1
+
+[[providers.keys]]
+id = "idlecloud-key"
+api_key_env = "IDLECLOUD_API_KEY"
+```
+
+For this provider:
+
+- `--prompt` maps to `positivePrompt`.
+- `negativePrompt` can be set with `[providers.params]` or `--param negativePrompt=...`; `negative_prompt` is accepted as an alias.
+- `--size` / `--aspect-ratio` maps to `width` and `height`.
+- `--image` maps the first input image to `image` as base64 and enables image-to-image fields.
+- `--mask` maps to `mask` and enables inpaint fields.
+- Use `--param` or `[providers.params]` for provider-specific features such as reference image arrays, V4 character captions, `seed`, `steps`, `scale`, `sampler`, `ucPreset`, `strength`, and `noise`.
+- The API documents a 20 second request interval and one concurrent task per user, so keep `max_concurrent_requests = 1` unless your account/provider explicitly allows more.
 
 ## Custom HTTP Provider
 

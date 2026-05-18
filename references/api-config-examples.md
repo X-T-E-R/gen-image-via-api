@@ -74,6 +74,61 @@ id = "minimal-router-key"
 api_key_env = "MINIMAL_ROUTER_API_KEY"
 ```
 
+
+## IdleCloud Native Image Job
+
+```toml
+[[providers]]
+id = "idlecloud"
+type = "idlecloud"
+base_url = "https://api.idlecloud.cc/api"
+model = "nai-diffusion-4-5-full"
+enabled = true
+priority = 15
+capabilities = ["generate", "edit"]
+images_per_request = 1
+max_concurrent_requests = 1
+
+[providers.params]
+negativePrompt = "lowres, bad anatomy"
+steps = 28
+scale = 5
+sampler = "k_euler"
+noise_schedule = "karras"
+ucPreset = 1
+
+[[providers.keys]]
+id = "idlecloud-key"
+api_key_env = "IDLECLOUD_API_KEY"
+```
+
+## NAI-Compatible IdleCloud Endpoint
+
+```toml
+[[providers]]
+id = "nai-idlecloud"
+type = "nai"
+base_url = "https://api.idlecloud.cc/api"
+model = "nai-diffusion-4-5-full"
+enabled = true
+priority = 16
+capabilities = ["generate", "edit"]
+images_per_request = 1
+max_concurrent_requests = 1
+
+[providers.params]
+negative_prompt = "lowres, bad anatomy"
+steps = 28
+scale = 5
+sampler = "k_euler"
+noise_schedule = "karras"
+ucPreset = 1
+
+[[providers.keys]]
+id = "nai-key"
+api_key_env = "IDLECLOUD_API_KEY"
+```
+
 ## Custom HTTP Async Provider
 
 ```toml

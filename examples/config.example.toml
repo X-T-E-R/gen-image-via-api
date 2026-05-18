@@ -28,9 +28,9 @@ body = "Style: cinematic, high detail.\n\n{{prompt}}\n\nRequested size: {{size}}
 [send]
 # Optional adapter used by `generate --send`, `once --send`, and `send`.
 # Set preset = "hermes" for Hermes Agent's messaging tool, or
-# preset = "openclaw" for OpenClaw-compatible env/command routing.
+# preset = "openclaw" for OpenClaw's `message send --media` CLI route.
 # For Python adapters, module.function receives one dict per output file/target.
-# For command adapters, command argv items may use {path}, {target}, and {message}.
+# For command adapters, command argv items may use {path}, {target}, {message}, and {caption}.
 method = "python-call"
 preset = ""
 module = ""
@@ -39,6 +39,14 @@ targets = []
 message_template = "MEDIA:{path}"
 retry_delays = [2, 5, 10]
 delay_seconds = 0
+
+# OpenClaw preset example:
+# preset = "openclaw"
+# targets = ["@mychat"]
+# message_template = "Generated {filename}\nMEDIA:{path}"
+# [send.args]
+# channel = "telegram"
+# force_document = true
 
 [[providers]]
 id = "mock-local"
@@ -105,6 +113,57 @@ images_per_request = 1
 max_concurrent_requests = 1
 
 [[providers]]
+id = "idlecloud"
+type = "idlecloud"
+base_url = "https://api.idlecloud.cc/api"
+model = "nai-diffusion-4-5-full"
+enabled = false
+priority = 15
+capabilities = ["generate", "edit"]
+images_per_request = 1
+max_concurrent_requests = 1
+
+[providers.params]
+negativePrompt = ""
+steps = 28
+scale = 5
+sampler = "k_euler"
+noise_schedule = "karras"
+ucPreset = 1
+
+[[providers.keys]]
+id = "idlecloud-key-a"
+api_key_env = "IDLECLOUD_API_KEY"
+images_per_request = 1
+max_concurrent_requests = 1
+
+[[providers]]
+id = "nai-idlecloud"
+type = "nai"
+base_url = "https://api.idlecloud.cc/api"
+model = "nai-diffusion-4-5-full"
+enabled = false
+priority = 16
+capabilities = ["generate", "edit"]
+images_per_request = 1
+max_concurrent_requests = 1
+
+[providers.params]
+negative_prompt = ""
+steps = 28
+scale = 5
+sampler = "k_euler"
+noise_schedule = "karras"
+ucPreset = 1
+
+[[providers.keys]]
+id = "nai-key-a"
+api_key_env = "IDLECLOUD_API_KEY"
+images_per_request = 1
+max_concurrent_requests = 1
+
+
+[[providers]]
 id = "custom-async-example"
 type = "custom-http"
 enabled = false
@@ -143,3 +202,5 @@ error_path = "data.error.message"
 [providers.poll.result]
 image_url_paths = ["data.images.*.url"]
 b64_json_paths = ["data.images.*.b64_json"]
+
+

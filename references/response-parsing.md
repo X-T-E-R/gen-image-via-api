@@ -53,6 +53,23 @@ Parser behavior:
 2. Prefer final image values found in completed output items.
 3. Fall back to the last `partial_image_b64` value when no final image value is present.
 
+
+## NAI / IdleCloud Payloads
+
+The `nai` provider accepts zip or direct image responses from `/ai/generate-image`. Zip archives are unpacked and image files inside the archive become normal job results.
+
+The `idlecloud` provider polls `/get_result/{job_id}` and reads:
+
+```json
+{
+  "status": "completed",
+  "image_base64": "iVBORw0KGgo...",
+  "image_url": "https://example/result.zip"
+}
+```
+
+`image_base64` is decoded directly. `image_url` is downloaded; if the download is a zip archive, images inside it are unpacked.
+
 ## Custom HTTP Providers
 
 Custom providers use configured result paths:

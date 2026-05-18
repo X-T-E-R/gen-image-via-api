@@ -43,6 +43,15 @@ class PromptTemplateConfig:
 
 
 @dataclass(frozen=True)
+class SendPresetConfig:
+    agent_path: str = ""
+    home: str = ""
+    module: str = ""
+    function: str = ""
+    command: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class SendConfig:
     method: str = "python-call"
     preset: str = ""
@@ -61,6 +70,8 @@ class SendConfig:
     delay_seconds: float = 0.0
     timeout_seconds: float = 60.0
     args: dict[str, Any] = field(default_factory=dict)
+    hermes: SendPresetConfig = field(default_factory=SendPresetConfig)
+    openclaw: SendPresetConfig = field(default_factory=SendPresetConfig)
 
 
 @dataclass(frozen=True)
@@ -349,20 +360,36 @@ def _load_prompt_templates(raw: Any) -> tuple[PromptTemplateConfig, ...]:
     return tuple(unique)
 
 
+def _parse_command_tuple(value: Any, *, field_name: str) -> tuple[str, ...]:
+    if value in (None, ""):
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, list):
+        return tuple(str(item) for item in value)
+    raise ConfigError(f"{field_name} must be a string or list")
+
+
+def _load_send_preset_config(raw: Any, *, field_name: str) -> SendPresetConfig:
+    if raw is None:
+        return SendPresetConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{field_name} must be a table")
+    return SendPresetConfig(
+        agent_path=str(raw.get("agent_path") or ""),
+        home=str(raw.get("home") or ""),
+        module=str(raw.get("module") or ""),
+        function=str(raw.get("function") or ""),
+        command=_parse_command_tuple(raw.get("command"), field_name=f"{field_name}.command"),
+    )
+
+
 def _load_send_config(raw: Any) -> SendConfig:
     if raw is None:
         return SendConfig()
     if not isinstance(raw, dict):
         raise ConfigError("[send] must be a table")
-    command = raw.get("command")
-    if command in (None, ""):
-        command_tuple = ()
-    elif isinstance(command, str):
-        command_tuple = (command,)
-    elif isinstance(command, list):
-        command_tuple = tuple(str(item) for item in command)
-    else:
-        raise ConfigError("[send].command must be a string or list")
+    command_tuple = _parse_command_tuple(raw.get("command"), field_name="[send].command")
     targets = _as_str_tuple(raw.get("targets"), ())
     default_target = str(raw["default_target"]) if raw.get("default_target") else None
     if default_target and not targets:
@@ -385,6 +412,8 @@ def _load_send_config(raw: Any) -> SendConfig:
         delay_seconds=_as_float(raw.get("delay_seconds"), 0.0, minimum=0.0),
         timeout_seconds=_as_float(raw.get("timeout_seconds"), 60.0),
         args=dict(raw.get("args") or {}),
+        hermes=_load_send_preset_config(raw.get("hermes"), field_name="[send.hermes]"),
+        openclaw=_load_send_preset_config(raw.get("openclaw"), field_name="[send.openclaw]"),
     )
 
 
@@ -507,10 +536,10 @@ body = "Style: cinematic, high detail.\\n\\n{{prompt}}\\n\\nRequested size: {{si
 [send]
 # Optional adapter used by `generate --send`, `once --send`, and `send`.
 # Set preset = "hermes" for Hermes Agent's messaging tool, or
-# preset = "openclaw" for OpenClaw-compatible env/command routing.
+# preset = "openclaw" for OpenClaw's `message send --media` CLI route.
 # `python-call` imports module.function and passes one dict per file/target.
-# Use `command` for a subprocess adapter with {path}, {target}, and {message}
-# placeholders in argv items.
+# Use `command` for a subprocess adapter with {path}, {target}, {message},
+# and {caption} placeholders in argv items.
 method = "python-call"
 preset = ""
 module = ""
@@ -519,6 +548,26 @@ targets = []
 message_template = "MEDIA:{path}"
 retry_delays = [2, 5, 10]
 delay_seconds = 0
+
+# OpenClaw preset example:
+# preset = "openclaw"
+# targets = ["@mychat"]
+# message_template = "Generated {filename}\\nMEDIA:{path}"
+# [send.args]
+# channel = "telegram"
+# force_document = true
+
+[send.hermes]
+agent_path = ""
+home = ""
+module = ""
+function = ""
+
+[send.openclaw]
+agent_path = ""
+module = ""
+function = ""
+command = []
 
 [[providers]]
 id = "mock-local"
@@ -584,6 +633,55 @@ api_key_env = "OPENAI_API_KEY_2"
 images_per_request = 1
 max_concurrent_requests = 1
 
+[[providers]]
+id = "idlecloud"
+type = "idlecloud"
+base_url = "https://api.idlecloud.cc/api"
+model = "nai-diffusion-4-5-full"
+enabled = false
+priority = 15
+capabilities = ["generate", "edit"]
+images_per_request = 1
+max_concurrent_requests = 1
+
+[providers.params]
+negativePrompt = ""
+steps = 28
+scale = 5
+sampler = "k_euler"
+noise_schedule = "karras"
+ucPreset = 1
+
+[[providers.keys]]
+id = "idlecloud-key-a"
+api_key_env = "IDLECLOUD_API_KEY"
+images_per_request = 1
+max_concurrent_requests = 1
+
+[[providers]]
+id = "nai-idlecloud"
+type = "nai"
+base_url = "https://api.idlecloud.cc/api"
+model = "nai-diffusion-4-5-full"
+enabled = false
+priority = 16
+capabilities = ["generate", "edit"]
+images_per_request = 1
+max_concurrent_requests = 1
+
+[providers.params]
+negative_prompt = ""
+steps = 28
+scale = 5
+sampler = "k_euler"
+noise_schedule = "karras"
+ucPreset = 1
+
+[[providers.keys]]
+id = "nai-key-a"
+api_key_env = "IDLECLOUD_API_KEY"
+images_per_request = 1
+max_concurrent_requests = 1
 # Custom HTTP providers can model async submit/poll APIs.
 # See references/config.md for all mapping fields.
 """
@@ -598,3 +696,5 @@ def write_example_config(path: str | Path, *, force: bool = False) -> Path:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(textwrap.dedent(EXAMPLE_CONFIG), encoding="utf-8")
     return out
+
+

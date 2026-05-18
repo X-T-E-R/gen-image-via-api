@@ -57,13 +57,25 @@ python scripts/gen_image_cli.py generate \
   --json
 ```
 
-Hermes Agent / OpenClaw-compatible presets:
+Hermes Agent and OpenClaw delivery presets:
 
 ```toml
 [send]
-preset = "hermes"   # or "openclaw"
+preset = "hermes"
 targets = ["telegram", "weixin"]
 message_template = "MEDIA:{path}"
+```
+
+Use `preset = "openclaw"` when OpenClaw's native `message send --media` CLI route is the delivery surface. Configure the OpenClaw channel under `[send.args]` and use an OpenClaw message target:
+
+```toml
+[send]
+preset = "openclaw"
+targets = ["@mychat"]
+message_template = "Generated {filename}\nMEDIA:{path}"
+
+[send.args]
+channel = "telegram"
 ```
 
 Edit or image-to-image from existing images:
@@ -103,6 +115,8 @@ python scripts/gen_image_cli.py submit \
 - Providers declare `capabilities = ["generate", "edit"]`.
 - Use `responses-image` when a router works through `/v1/responses` with an `image_generation` tool.
 - Use `any` for browser-style anyrouter-compatible `/v1/responses` image generation; it uses the minimal tool shape from the bundled HTML sample.
+- Use `nai` for NovelAI-compatible `/api/ai/generate-image` style endpoints that return zip/image payloads.
+- Use `idlecloud` for IdleCloud's native `/api/generate_image` + `/api/get_result/{job_id}` image job API.
 - Use `keys_file` when the user has a local secret file whose first line is the site and later lines are API keys.
 - Provider selection:
   1. job `--provider`;
@@ -131,7 +145,14 @@ python scripts/gen_image_cli.py status <job_id>
 python scripts/gen_image_cli.py retry <job_id>
 python scripts/gen_image_cli.py cancel <job_id>
 python scripts/gen_image_cli.py send --path output/imagegen/example.png --target telegram --json
+python scripts/gen_image_cli.py webui --open
 python scripts/gen_image_cli.py stop-worker
+```
+
+The WebUI is optional and uses Gradio. Install its extra dependencies only when needed:
+
+```bash
+pip install -e ".[webui]"
 ```
 
 Pass common image parameters without changing config:

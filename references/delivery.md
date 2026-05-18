@@ -60,18 +60,60 @@ The Hermes preset sends the same payload shape as a normal Hermes messaging tool
 }
 ```
 
-### OpenClaw-Compatible
+### OpenClaw
 
-OpenClaw installations do not all expose the same messaging callable. The preset supports two portable routes:
+OpenClaw's durable outbound interface is its message command:
+`openclaw message send --channel <channel> --target <target> --media <path>`.
+Its MCP channel bridge also exposes `messages_send`, but that MCP tool currently
+sends text back through an existing conversation route and is not a portable
+file/media upload API.
+
+Use the `openclaw` preset when you want this CLI route, or when you have a local
+custom callable/command adapter.
 
 ```toml
 [send]
 preset = "openclaw"
-targets = ["telegram"]
-message_template = "MEDIA:{path}"
+targets = ["@mychat"]
+message_template = "Generated {filename}\nMEDIA:{path}"
+
+[send.args]
+channel = "telegram"
+# Optional. Defaults to "openclaw"; use an array when a wrapper needs arguments.
+# openclaw_cli = ["python", "C:/path/to/openclaw-wrapper.py"]
+# force_document = true
 ```
 
-Route through a Python callable:
+Then run:
+
+```bash
+python scripts/gen_image_cli.py send \
+  --path output/imagegen/example.png \
+  --target @mychat \
+  --json
+```
+
+The preset calls:
+
+```bash
+openclaw message send --channel telegram --target @mychat --media output/imagegen/example.png --message "Generated example.png" --json
+```
+
+The media token is removed before building the CLI `--message` caption. If
+`message_template` is the default `MEDIA:{path}`, the OpenClaw CLI receives
+`--media <path>` with no message body.
+
+OpenClaw preset environment overrides:
+
+```bash
+set OPENCLAW_SEND_CLI=openclaw
+set OPENCLAW_SEND_CHANNEL=telegram
+set OPENCLAW_SEND_ACCOUNT=default
+set OPENCLAW_SEND_FORCE_DOCUMENT=true
+```
+
+For installations that expose their own Python adapter, keep using the explicit
+callable route:
 
 ```bash
 set OPENCLAW_AGENT_PATH=C:\path\to\openclaw-or-skill-root
@@ -79,13 +121,15 @@ set OPENCLAW_SEND_MODULE=my_sender
 set OPENCLAW_SEND_FUNCTION=send
 ```
 
-Or route through a command:
+Or route through a fully custom command:
 
 ```bash
-set OPENCLAW_SEND_COMMAND=python send_file.py --target {target} --message {message} --file {path}
+set OPENCLAW_SEND_COMMAND=openclaw message send --channel telegram --target {target} --media {path} --message "{caption}" --json
 ```
 
-If neither OpenClaw route is configured, the preset automatically tries the Hermes-compatible messaging tool when Hermes is installed.
+`preset = "openclaw"` does not fall back to Hermes Agent. Use
+`preset = "hermes"` explicitly when Hermes Agent's `send_message_tool` is the
+intended delivery surface.
 
 ### Python Callable Adapter
 
@@ -144,6 +188,7 @@ Placeholders available in `message_template` and `command` entries:
 - `{path}`: full output file path
 - `{filename}`: output filename
 - `{target}`: selected send target
+- `{caption}` / `{message_without_media}`: `message_template` with `MEDIA:{path}` removed
 
 ## Return Handling
 

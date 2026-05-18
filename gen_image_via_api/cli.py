@@ -2,22 +2,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import replace
 import json
 from pathlib import Path
-import re
+import shlex
 import sys
 import time
 from typing import Any
 
 from .config import DEFAULT_CONFIG_NAME, ConfigError, load_config, resolve_config_path, write_example_config
 from .delivery import SendError, send_paths
+from .provider_support import COMMON_DIRECT_CLI_PARAMS, provider_parameter_support
 from .queue import ImageQueue, JobRecord
 from .prompting import render_prompt_template
 from .service import ensure_worker, serve_forever, stop_worker, worker_status
 from .worker import Worker, run_queue
+from .webui import serve_webui
 
 
-COMMON_DIRECT_CLI_PARAMS = ("size", "aspect_ratio", "size_tier", "output_format", "background", "output_compression")
 RATIO_ALIASES = {
     "square": "1:1",
     "landscape": "3:2",
@@ -40,16 +42,16 @@ def _read_prompt(prompt: str | None, prompt_file: str | None) -> str:
     raise SystemExit("Missing prompt. Use --prompt or --prompt-file.")
 
 
-def _parse_param(items: list[str] | None) -> dict[str, Any]:
+def _parse_param(items: list[str] | None, *, flag_name: str = "--param") -> dict[str, Any]:
     params: dict[str, Any] = {}
     for item in items or []:
         if "=" not in item:
-            raise SystemExit(f"Invalid --param value (expected key=value): {item}")
+            raise SystemExit(f"Invalid {flag_name} value (expected key=value): {item}")
         key, value = item.split("=", 1)
         key = key.strip()
         value = value.strip()
         if not key:
-            raise SystemExit("Invalid --param: empty key")
+            raise SystemExit(f"Invalid {flag_name}: empty key")
         try:
             parsed: Any = json.loads(value)
         except json.JSONDecodeError:
@@ -360,12 +362,111 @@ def _paths_from_job_payload(job: dict[str, Any]) -> list[str]:
 
 def _send_job_results(config, args: argparse.Namespace, job: dict[str, Any]) -> dict[str, Any]:
     paths = _paths_from_job_payload(job)
+    send_config = _config_with_send_overrides(config, args)
     return send_paths(
-        config,
+        send_config,
         paths,
         targets=getattr(args, "send_target", None),
         message_template=getattr(args, "send_message", None),
     )
+
+
+def _split_send_command(value: str, *, flag_name: str) -> tuple[str, ...]:
+    try:
+        return tuple(shlex.split(value, posix=sys.platform != "win32"))
+    except ValueError as exc:
+        raise SystemExit(f"Invalid {flag_name}: {exc}") from exc
+
+
+def _config_with_send_overrides(config, args: argparse.Namespace):
+    send = config.send
+    updates: dict[str, Any] = {}
+    string_fields = {
+        "send_method": "method",
+        "send_preset": "preset",
+        "send_module": "module",
+        "send_function": "function",
+        "send_action": "action",
+        "send_target_arg": "target_arg",
+        "send_message_arg": "message_arg",
+        "send_path_arg": "path_arg",
+        "send_action_arg": "action_arg",
+    }
+    for arg_name, field_name in string_fields.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            updates[field_name] = str(value)
+
+    if getattr(args, "send_command", None):
+        updates["command"] = _split_send_command(args.send_command, flag_name="--send-command")
+    if getattr(args, "send_retry_delay", None) is not None:
+        updates["retry_delays"] = tuple(max(0.0, float(item)) for item in args.send_retry_delay)
+    if getattr(args, "send_delay_seconds", None) is not None:
+        updates["delay_seconds"] = max(0.0, float(args.send_delay_seconds))
+    if getattr(args, "send_timeout_seconds", None) is not None:
+        updates["timeout_seconds"] = max(0.1, float(args.send_timeout_seconds))
+
+    args_updates = dict(send.args)
+    args_updates.update(_parse_param(getattr(args, "send_arg", None), flag_name="--send-arg"))
+    openclaw_cli = getattr(args, "send_openclaw_cli", None)
+    if openclaw_cli:
+        args_updates["openclaw_cli"] = list(_split_send_command(openclaw_cli, flag_name="--send-openclaw-cli"))
+    openclaw_arg_fields = {
+        "send_openclaw_channel": "channel",
+        "send_openclaw_account": "account",
+        "send_openclaw_reply_to": "reply_to",
+        "send_openclaw_thread_id": "thread_id",
+    }
+    for arg_name, field_name in openclaw_arg_fields.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            args_updates[field_name] = str(value)
+    openclaw_bool_fields = {
+        "send_openclaw_force_document": "force_document",
+        "send_openclaw_silent": "silent",
+        "send_openclaw_pin": "pin",
+        "send_openclaw_dry_run": "dry_run",
+    }
+    for arg_name, field_name in openclaw_bool_fields.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            args_updates[field_name] = bool(value)
+    if args_updates != send.args:
+        updates["args"] = args_updates
+
+    hermes_updates: dict[str, Any] = {}
+    for arg_name, field_name in {
+        "send_hermes_agent_path": "agent_path",
+        "send_hermes_home": "home",
+        "send_hermes_module": "module",
+        "send_hermes_function": "function",
+    }.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            hermes_updates[field_name] = str(value)
+    if hermes_updates:
+        updates["hermes"] = replace(send.hermes, **hermes_updates)
+
+    openclaw_updates: dict[str, Any] = {}
+    for arg_name, field_name in {
+        "send_openclaw_agent_path": "agent_path",
+        "send_openclaw_module": "module",
+        "send_openclaw_function": "function",
+    }.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            openclaw_updates[field_name] = str(value)
+    if getattr(args, "send_openclaw_command", None):
+        openclaw_updates["command"] = _split_send_command(
+            args.send_openclaw_command,
+            flag_name="--send-openclaw-command",
+        )
+    if openclaw_updates:
+        updates["openclaw"] = replace(send.openclaw, **openclaw_updates)
+
+    if not updates:
+        return config
+    return replace(config, send=replace(send, **updates))
 
 
 def _worker_summary(worker: dict[str, Any]) -> dict[str, Any]:
@@ -436,118 +537,8 @@ def _provider_capacity(provider) -> int:
     return max(0, capacity)
 
 
-def _is_codex_cli_like_provider(provider) -> bool:
-    return provider.codex_cli or str(provider.headers.get("originator") or provider.headers.get("Originator") or "").lower() == "codex_cli_rs"
-
-
-def _extract_template_param_refs(value: Any) -> set[str]:
-    refs: set[str] = set()
-    if isinstance(value, str):
-        refs.update(re.findall(r"\$params\.([A-Za-z_][A-Za-z0-9_]*)", value))
-    elif isinstance(value, dict):
-        for child in value.values():
-            refs.update(_extract_template_param_refs(child))
-    elif isinstance(value, list):
-        for child in value:
-            refs.update(_extract_template_param_refs(child))
-    return refs
-
-
 def _provider_parameter_support(provider) -> dict[str, Any]:
-    if provider.type == "mock":
-        return {
-            "common_cli_params": [],
-            "provider_cli_params": [],
-            "direct_cli_params": [],
-            "extra_params_via_param": [],
-            "ignored_params": [],
-            "notes": ["mock provider returns a fixed offline PNG and ignores image tuning params"],
-        }
-
-    if provider.type == "openai-images":
-        return {
-            "common_cli_params": list(COMMON_DIRECT_CLI_PARAMS),
-            "provider_cli_params": ["quality", "moderation", "model"],
-            "direct_cli_params": [*COMMON_DIRECT_CLI_PARAMS, "quality", "moderation", "model"],
-            "extra_params_via_param": ["input_fidelity", "response_format", "prompt_rewrite_guard", "append_size_to_prompt"],
-            "ignored_params": ["action", "stream"],
-            "notes": [
-                "action and stream are accepted by the CLI but ignored for Images API providers",
-                "provider.response_format_b64_json adds response_format=b64_json when the job does not set one",
-                "provider.codex_cli omits quality and prefixes the no-rewrite prompt guard",
-                "provider.append_size_to_prompt appends a size/ratio instruction to the submitted prompt",
-                "output_compression is sent only when output_format is jpeg or webp",
-                "transparent background support is model-specific and some providers may reject it",
-                "model belongs in provider config; per-job model override is also accepted with --model",
-            ],
-        }
-
-    if provider.type in {"responses-image", "any"}:
-        extras = [
-            "tool_choice",
-            "omit_tool_choice",
-            "omit_action",
-            "omit_size",
-            "omit_quality",
-            "reasoning",
-            "metadata",
-            "max_output_tokens",
-            "previous_response_id",
-            "partial_images",
-            "responses_stream_partial_images",
-            "force_responses_stream",
-            "prompt_rewrite_guard",
-            "append_size_to_prompt",
-        ]
-        notes = [
-            "moderation is not sent to the Responses image_generation tool",
-            "provider.force_responses_stream forces stream=true even if a job passes --no-stream",
-            "provider.responses_stream_partial_images adds partial_images to the image_generation tool, clamped to 0-3",
-            "provider.append_size_to_prompt appends a size/ratio instruction to the submitted prompt",
-            "output_compression is sent only when output_format is jpeg or webp",
-            "transparent background support is model-specific and some providers may reject it",
-            "omit_action/omit_size/omit_tool_choice can match minimal browser-style routers",
-        ]
-        if provider.type == "any":
-            notes.append("type=any defaults to omitting action, size, and tool_choice to match the browser sample")
-        if _is_codex_cli_like_provider(provider):
-            notes.append("quality is intentionally omitted for codex-cli-style routers")
-        return {
-            "common_cli_params": list(COMMON_DIRECT_CLI_PARAMS),
-            "provider_cli_params": ["quality", "model", "action", "stream"],
-            "direct_cli_params": [*COMMON_DIRECT_CLI_PARAMS, "quality", "model", "action", "stream"],
-            "extra_params_via_param": extras,
-            "ignored_params": ["moderation"],
-            "notes": notes,
-        }
-
-    if provider.type == "custom-http":
-        refs = sorted(
-            _extract_template_param_refs(provider.submit)
-            | _extract_template_param_refs(provider.edit_submit)
-            | _extract_template_param_refs(provider.poll)
-        )
-        direct = [param for param in COMMON_DIRECT_CLI_PARAMS if param in refs]
-        extra = [param for param in refs if param not in COMMON_DIRECT_CLI_PARAMS]
-        return {
-            "common_cli_params": direct,
-            "provider_cli_params": extra,
-            "direct_cli_params": direct,
-            "extra_params_via_param": extra,
-            "ignored_params": [],
-            "notes": [
-                "custom-http support depends on $params.* references in submit/edit/poll mappings",
-            ],
-        }
-
-    return {
-        "common_cli_params": list(COMMON_DIRECT_CLI_PARAMS),
-        "provider_cli_params": [],
-        "direct_cli_params": list(COMMON_DIRECT_CLI_PARAMS),
-        "extra_params_via_param": [],
-        "ignored_params": [],
-        "notes": [f"unknown provider type: {provider.type}"],
-    }
+    return provider_parameter_support(provider)
 
 
 def _capacity_report(config) -> dict[str, Any]:
@@ -953,8 +944,9 @@ def cmd_send(args: argparse.Namespace) -> int:
             queue.close()
     if not paths:
         raise SystemExit("Nothing to send. Use --path or --job-id.")
+    send_config = _config_with_send_overrides(config, args)
     report = send_paths(
-        config,
+        send_config,
         paths,
         targets=args.send_target,
         message_template=args.send_message,
@@ -1103,6 +1095,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if not issues else 1
 
 
+def cmd_webui(args: argparse.Namespace) -> int:
+    config = _load_app(args)
+    return serve_webui(
+        config,
+        host=args.host,
+        port=args.port,
+        open_browser=bool(args.open),
+        share=bool(args.share),
+    )
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     config = _load_app(args)
     result = asyncio.run(serve_forever(config))
@@ -1165,6 +1168,41 @@ def add_send_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--send", action="store_true", help="Send completed output files using the [send] adapter")
     parser.add_argument("--send-target", action="append", help="Delivery target. Repeat to send to multiple targets.")
     parser.add_argument("--send-message", help="Override [send].message_template for this command")
+    add_send_override_args(parser)
+
+
+def add_send_override_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--send-method", help="Override [send].method for this command")
+    parser.add_argument("--send-preset", help="Override [send].preset for this command")
+    parser.add_argument("--send-module", help="Override [send].module for method=python-call")
+    parser.add_argument("--send-function", help="Override [send].function for method=python-call")
+    parser.add_argument("--send-command", help="Override [send].command as a shell-like command template")
+    parser.add_argument("--send-action", help="Override [send].action payload value")
+    parser.add_argument("--send-target-arg", help="Override [send].target_arg")
+    parser.add_argument("--send-message-arg", help="Override [send].message_arg")
+    parser.add_argument("--send-path-arg", help="Override [send].path_arg")
+    parser.add_argument("--send-action-arg", help="Override [send].action_arg")
+    parser.add_argument("--send-arg", action="append", help="Extra send adapter arg as key=value; JSON values allowed")
+    parser.add_argument("--send-retry-delay", type=float, action="append", help="Retry delay in seconds. Repeat for multiple retries.")
+    parser.add_argument("--send-delay-seconds", type=float, help="Pause between file/target deliveries")
+    parser.add_argument("--send-timeout-seconds", type=float, help="Subprocess adapter timeout in seconds")
+    parser.add_argument("--send-hermes-agent-path", help="Override [send.hermes].agent_path")
+    parser.add_argument("--send-hermes-home", help="Override [send.hermes].home")
+    parser.add_argument("--send-hermes-module", help="Override [send.hermes].module")
+    parser.add_argument("--send-hermes-function", help="Override [send.hermes].function")
+    parser.add_argument("--send-openclaw-agent-path", help="Override [send.openclaw].agent_path")
+    parser.add_argument("--send-openclaw-module", help="Override [send.openclaw].module")
+    parser.add_argument("--send-openclaw-function", help="Override [send.openclaw].function")
+    parser.add_argument("--send-openclaw-command", help="Override [send.openclaw].command as a shell-like command template")
+    parser.add_argument("--send-openclaw-cli", help="OpenClaw CLI command for the native message-send preset")
+    parser.add_argument("--send-openclaw-channel", help="OpenClaw message channel for the native CLI route")
+    parser.add_argument("--send-openclaw-account", help="OpenClaw channel account id")
+    parser.add_argument("--send-openclaw-reply-to", help="OpenClaw reply-to message id")
+    parser.add_argument("--send-openclaw-thread-id", help="OpenClaw thread id")
+    parser.add_argument("--send-openclaw-force-document", action="store_true", default=None, help="Pass --force-document to OpenClaw")
+    parser.add_argument("--send-openclaw-silent", action="store_true", default=None, help="Pass --silent to OpenClaw")
+    parser.add_argument("--send-openclaw-pin", action="store_true", default=None, help="Pass --pin to OpenClaw")
+    parser.add_argument("--send-openclaw-dry-run", action="store_true", default=None, help="Pass --dry-run to OpenClaw")
 
 
 def add_autostart_arg(parser: argparse.ArgumentParser) -> None:
@@ -1261,6 +1299,7 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--job-id", help="Send all output files recorded for a completed job.")
     send.add_argument("--target", "--send-target", dest="send_target", action="append", help="Delivery target. Repeat for multiple targets.")
     send.add_argument("--message", "--send-message", dest="send_message", help="Override [send].message_template for this command")
+    add_send_override_args(send)
     send.add_argument("--json", action="store_true")
     send.add_argument("--verbose", action="store_true", help="Pretty-print JSON output.")
     send.set_defaults(func=cmd_send)
@@ -1310,6 +1349,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_config_arg(doctor)
     doctor.add_argument("--json", action="store_true")
     doctor.set_defaults(func=cmd_doctor)
+
+    webui = sub.add_parser("webui", help="Start the optional Gradio WebUI")
+    add_config_arg(webui)
+    webui.add_argument("--host", default="127.0.0.1")
+    webui.add_argument("--port", type=int, default=8765)
+    webui.add_argument("--open", action="store_true", help="Open the Web UI in the default browser")
+    webui.add_argument("--share", action="store_true", help="Ask Gradio to create a temporary public share URL")
+    webui.set_defaults(func=cmd_webui)
     return parser
 
 

@@ -84,7 +84,7 @@ def _validate_paths(paths: list[str]) -> list[str]:
             raise SendError(f"Output path does not exist: {path}")
         if not path.is_file():
             raise SendError(f"Output path is not a file: {path}")
-        resolved.append(str(path))
+        resolved.append(str(path.resolve()))
     return resolved
 
 
@@ -147,9 +147,10 @@ def _render_message(template: str, *, path: str, target: str) -> str:
         "filename": Path(path).name,
     }
     try:
-        return template.format_map(values)
+        rendered = template.format_map(values)
     except KeyError as exc:
         raise SendError(f"Unknown send message placeholder: {exc}") from exc
+    return rendered.replace("\\n", "\n")
 
 
 def _dispatch(config: AppConfig, *, path: str, target: str, message: str) -> Any:
@@ -196,39 +197,93 @@ def _dispatch_preset(config: AppConfig, *, path: str, target: str, message: str)
 
 
 def _dispatch_hermes_preset(config: AppConfig, *, path: str, target: str, message: str) -> Any:
-    roots = _candidate_hermes_agent_roots()
-    _load_hermes_environment(roots)
-    func = _import_callable("tools.send_message_tool", "send_message_tool", roots)
+    roots = _candidate_hermes_agent_roots(config.send)
+    _load_hermes_environment(roots, hermes_home=config.send.hermes.home)
+    module = config.send.hermes.module or "tools.send_message_tool"
+    function = config.send.hermes.function or "send_message_tool"
+    func = _import_callable(module, function, roots)
     return _decode_result(func(_payload_for_call(config, path=path, target=target, message=message)))
 
 
 def _dispatch_openclaw_preset(config: AppConfig, *, path: str, target: str, message: str) -> Any:
-    env_module = os.getenv("OPENCLAW_SEND_MODULE", "").strip()
-    env_function = os.getenv("OPENCLAW_SEND_FUNCTION", "").strip()
-    roots = _candidate_openclaw_roots()
-    if env_module and env_function:
-        func = _import_callable(env_module, env_function, roots)
+    send = config.send.openclaw
+    module = send.module or os.getenv("OPENCLAW_SEND_MODULE", "").strip()
+    function = send.function or os.getenv("OPENCLAW_SEND_FUNCTION", "").strip()
+    roots = _candidate_openclaw_roots(config.send)
+    if module and function:
+        func = _import_callable(module, function, roots)
         return _decode_result(func(_payload_for_call(config, path=path, target=target, message=message)))
 
+    command = send.command
     env_command = os.getenv("OPENCLAW_SEND_COMMAND", "").strip()
-    if env_command:
+    if not command and env_command:
+        command = _split_command(env_command)
+    if command:
         return _run_command(
-            _format_command(_split_command(env_command), path=path, target=target, message=message),
+            _format_command(command, path=path, target=target, message=message),
             cwd=config.base_dir,
             timeout=config.send.timeout_seconds,
         )
 
-    # OpenClaw installations do not expose one universal send callable. Hermes
-    # Agent provides a compatible messaging tool after OpenClaw migrations, so
-    # use it automatically when present.
-    try:
-        return _dispatch_hermes_preset(config, path=path, target=target, message=message)
-    except SendError as exc:
-        raise SendError(
-            "OpenClaw send preset needs OPENCLAW_SEND_MODULE/OPENCLAW_SEND_FUNCTION "
-            "or OPENCLAW_SEND_COMMAND. Hermes-compatible fallback was unavailable: "
-            f"{exc}"
-        ) from exc
+    return _dispatch_openclaw_cli_preset(config, path=path, target=target, message=message)
+
+
+def _dispatch_openclaw_cli_preset(config: AppConfig, *, path: str, target: str, message: str) -> dict[str, Any]:
+    argv = [
+        *_openclaw_cli_argv(config),
+        "message",
+        "send",
+    ]
+    channel = _send_env_or_arg(config.send, "OPENCLAW_SEND_CHANNEL", "channel")
+    if channel:
+        argv.extend(["--channel", channel])
+    account = _send_env_or_arg(config.send, "OPENCLAW_SEND_ACCOUNT", "account")
+    if account:
+        argv.extend(["--account", account])
+    argv.extend(["--target", target, "--media", path])
+
+    caption = _caption_from_media_message(message, path)
+    if caption:
+        argv.extend(["--message", caption])
+    reply_to = _send_env_or_arg(config.send, "OPENCLAW_SEND_REPLY_TO", "reply_to")
+    if reply_to:
+        argv.extend(["--reply-to", reply_to])
+    thread_id = _send_env_or_arg(config.send, "OPENCLAW_SEND_THREAD_ID", "thread_id")
+    if thread_id:
+        argv.extend(["--thread-id", thread_id])
+    if _send_env_or_bool_arg(config.send, "OPENCLAW_SEND_FORCE_DOCUMENT", "force_document"):
+        argv.append("--force-document")
+    if _send_env_or_bool_arg(config.send, "OPENCLAW_SEND_SILENT", "silent"):
+        argv.append("--silent")
+    if _send_env_or_bool_arg(config.send, "OPENCLAW_SEND_PIN", "pin"):
+        argv.append("--pin")
+    if _send_env_or_bool_arg(config.send, "OPENCLAW_SEND_DRY_RUN", "dry_run"):
+        argv.append("--dry-run")
+    argv.append("--json")
+
+    return _run_command(
+        argv,
+        cwd=config.base_dir,
+        timeout=config.send.timeout_seconds,
+    )
+
+
+def _openclaw_cli_argv(config: AppConfig) -> list[str]:
+    raw = os.getenv("OPENCLAW_SEND_CLI", "").strip()
+    if raw:
+        return list(_split_command(raw))
+
+    configured = config.send.args.get("openclaw_cli")
+    if isinstance(configured, (list, tuple)):
+        argv = [str(item) for item in configured if str(item).strip()]
+        if argv:
+            return argv
+    if configured:
+        argv = list(_split_command(str(configured)))
+        if argv:
+            return argv
+
+    return ["openclaw"]
 
 
 def _dispatch_command(config: AppConfig, *, path: str, target: str, message: str) -> dict[str, Any]:
@@ -242,13 +297,56 @@ def _dispatch_command(config: AppConfig, *, path: str, target: str, message: str
 
 
 def _format_command(command: tuple[str, ...] | list[str], *, path: str, target: str, message: str) -> list[str]:
+    caption = _caption_from_media_message(message, path)
     values = {
         "path": path,
         "target": target,
         "message": message,
+        "caption": caption,
+        "message_without_media": caption,
         "filename": Path(path).name,
     }
-    return [item.format_map(values) for item in command]
+    try:
+        return [item.format_map(values) for item in command]
+    except KeyError as exc:
+        raise SendError(f"Unknown send command placeholder: {exc}") from exc
+
+
+def _caption_from_media_message(message: str, path: str) -> str:
+    marker = f"MEDIA:{path}"
+    text = message.replace(marker, "")
+    normalized_marker = f"MEDIA:{Path(path)}"
+    if normalized_marker != marker:
+        text = text.replace(normalized_marker, "")
+    return text.replace("\r\n", "\n").strip()
+
+
+def _send_env_or_arg(send: SendConfig, env_name: str, arg_name: str) -> str:
+    value = os.getenv(env_name, "").strip()
+    if value:
+        return value
+    raw = send.args.get(arg_name)
+    if raw is None:
+        return ""
+    return str(raw).strip()
+
+
+def _send_env_or_bool_arg(send: SendConfig, env_name: str, arg_name: str) -> bool:
+    value = os.getenv(env_name, "").strip()
+    if value:
+        return _as_bool(value)
+    raw = send.args.get(arg_name)
+    return _as_bool(raw)
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
 
 
 def _run_command(argv: list[str], *, cwd: Path, timeout: float) -> dict[str, Any]:
@@ -312,13 +410,15 @@ def _purge_loaded_module(module_name: str) -> None:
             sys.modules.pop(name, None)
 
 
-def _candidate_hermes_agent_roots() -> list[Path]:
+def _candidate_hermes_agent_roots(send: SendConfig | None = None) -> list[Path]:
     roots: list[Path] = []
+    if send and send.hermes.agent_path:
+        roots.append(Path(send.hermes.agent_path).expanduser())
     for env_name in ("HERMES_AGENT_PATH", "HERMES_AGENT_ROOT"):
         value = os.getenv(env_name, "").strip()
         if value:
             roots.append(Path(value).expanduser())
-    home = os.getenv("HERMES_HOME", "").strip()
+    home = (send.hermes.home if send else "") or os.getenv("HERMES_HOME", "").strip()
     if home:
         roots.append(Path(home).expanduser() / "hermes-agent")
     local_appdata = os.getenv("LOCALAPPDATA", "").strip()
@@ -328,8 +428,10 @@ def _candidate_hermes_agent_roots() -> list[Path]:
     return _unique_existing_or_candidate_paths(roots)
 
 
-def _candidate_openclaw_roots() -> list[Path]:
+def _candidate_openclaw_roots(send: SendConfig | None = None) -> list[Path]:
     roots: list[Path] = []
+    if send and send.openclaw.agent_path:
+        roots.append(Path(send.openclaw.agent_path).expanduser())
     for env_name in ("OPENCLAW_AGENT_PATH", "OPENCLAW_AGENT_ROOT", "OPENCLAW_HOME", "OPENCLAW_WORKSPACE"):
         value = os.getenv(env_name, "").strip()
         if value:
@@ -355,16 +457,17 @@ def _unique_existing_or_candidate_paths(paths: list[Path]) -> list[Path]:
     return out
 
 
-def _load_hermes_environment(roots: list[Path]) -> None:
-    hermes_home = Path(os.getenv("HERMES_HOME", "")).expanduser() if os.getenv("HERMES_HOME") else None
+def _load_hermes_environment(roots: list[Path], *, hermes_home: str = "") -> None:
+    resolved_home = hermes_home or os.getenv("HERMES_HOME", "")
+    hermes_home_path = Path(resolved_home).expanduser() if resolved_home else None
     for root in roots:
         if not root.exists():
             continue
         try:
             func = _import_callable("hermes_cli.env_loader", "load_hermes_dotenv", [root])
             kwargs: dict[str, Any] = {}
-            if hermes_home:
-                kwargs["hermes_home"] = hermes_home
+            if hermes_home_path:
+                kwargs["hermes_home"] = hermes_home_path
             project_env = root / ".env"
             if project_env.exists():
                 kwargs["project_env"] = project_env
@@ -405,3 +508,4 @@ def _error_from_result(result: dict[str, Any]) -> str:
         if value:
             return str(value)
     return json.dumps(result, ensure_ascii=False, sort_keys=True)
+

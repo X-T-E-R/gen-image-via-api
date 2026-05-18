@@ -75,6 +75,20 @@ python scripts/gen_image_cli.py send \
 ```
 
 The `--send` flag and `send` command use the optional `[send]` adapter. See `references/delivery.md`.
+For one-off delivery runs, the CLI can override the configured adapter without editing TOML:
+
+```bash
+python scripts/gen_image_cli.py send \
+  --path output/imagegen/mug-hero.png \
+  --target @mychat \
+  --send-preset openclaw \
+  --send-openclaw-channel telegram \
+  --json
+```
+
+Useful override flags include `--send-preset`, `--send-method`, `--send-command`,
+`--send-arg key=value`, `--send-openclaw-cli`, `--send-openclaw-channel`, and
+`--send-openclaw-force-document`.
 
 ## Output Shape
 
@@ -132,6 +146,23 @@ python scripts/gen_image_cli.py run
 ```
 
 `run` prints processed/succeeded/failed counts, worker count, queue summary before/after, and recent output paths. It is retained for debugging and scripts that explicitly want foreground queue draining.
+
+## Optional WebUI
+
+The WebUI is an optional Gradio interface over the same TOML config, SQLite queue, managed worker, and provider routing used by the CLI. The base package does not install WebUI dependencies.
+
+```bash
+pip install -e ".[webui]"
+python scripts/gen_image_cli.py webui --open
+```
+
+Useful options:
+
+- `--host 127.0.0.1`
+- `--port 8765`
+- `--share` to ask Gradio for a temporary public share URL
+
+Provider-specific features are surfaced through the provider capability report in the UI. Parameters without direct controls can be passed as a JSON object in **Extra params JSON**.
 
 ## Inspect And Repair
 

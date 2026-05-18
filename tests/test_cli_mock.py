@@ -387,6 +387,62 @@ class MockCliTests(unittest.TestCase):
             ]
             self.assertEqual(sent_targets, ["telegram", "weixin"])
 
+    def test_send_command_accepts_adapter_cli_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            cwd = Path(raw)
+            config = cwd / "gen-image.toml"
+            sender = cwd / "fake_sender.py"
+            sender.write_text(
+                "\n".join(
+                    [
+                        "import json",
+                        "from pathlib import Path",
+                        "",
+                        "def send_file(args):",
+                        "    log = Path(__file__).with_name('send-log.jsonl')",
+                        "    with log.open('a', encoding='utf-8') as fh:",
+                        "        fh.write(json.dumps(args, sort_keys=True) + '\\n')",
+                        "    return {'ok': True}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            image = cwd / "ready.png"
+            image.write_bytes(b"image")
+            self.run_cli("init-config", "--out", str(config), cwd=cwd)
+
+            result = self.run_cli(
+                "send",
+                "--config",
+                str(config),
+                "--path",
+                str(image),
+                "--target",
+                "telegram",
+                "--send-method",
+                "python-call",
+                "--send-module",
+                "fake_sender",
+                "--send-function",
+                "send_file",
+                "--send-action",
+                "deliver",
+                "--send-message",
+                "Caption {filename}\\nMEDIA:{path}",
+                "--send-arg",
+                "extra=true",
+                "--json",
+                cwd=ROOT,
+            )
+
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            sent = json.loads((cwd / "send-log.jsonl").read_text(encoding="utf-8").strip())
+            self.assertEqual(sent["action"], "deliver")
+            self.assertEqual(sent["target"], "telegram")
+            self.assertTrue(sent["extra"])
+            self.assertEqual(sent["message"], f"Caption ready.png\nMEDIA:{image}")
+
     def test_hermes_preset_uses_compatible_send_tool(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             cwd = Path(raw)
@@ -489,6 +545,75 @@ class MockCliTests(unittest.TestCase):
             sent = json.loads((openclaw_root / "openclaw-send-log.jsonl").read_text(encoding="utf-8").strip())
             self.assertEqual(sent["target"], "telegram")
             self.assertTrue(sent["message"].startswith("MEDIA:"))
+
+    def test_openclaw_preset_uses_native_message_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            cwd = Path(raw)
+            fake_cli = cwd / "fake_openclaw.py"
+            fake_cli.write_text(
+                "\n".join(
+                    [
+                        "import json",
+                        "import sys",
+                        "from pathlib import Path",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "Path(__file__).with_name('openclaw-cli-log.json').write_text(",
+                        "    json.dumps(argv, ensure_ascii=False), encoding='utf-8'",
+                        ")",
+                        "print(json.dumps({'ok': True, 'argv': argv}))",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config = cwd / "gen-image.toml"
+            image = cwd / "ready.png"
+            image.write_bytes(b"image")
+            self.run_cli("init-config", "--out", str(config), cwd=cwd)
+            text = config.read_text(encoding="utf-8")
+            text = text.replace('preset = ""', 'preset = "openclaw"')
+            text = text.replace('message_template = "MEDIA:{path}"', 'message_template = "Generated {filename}\\nMEDIA:{path}"')
+            text = text.replace("retry_delays = [2, 5, 10]", "retry_delays = []")
+            text += (
+                "\n[send.args]\n"
+                f"openclaw_cli = {json.dumps([sys.executable, str(fake_cli)])}\n"
+                'channel = "telegram"\n'
+                "force_document = true\n"
+            )
+            config.write_text(text, encoding="utf-8")
+
+            result = self.run_cli(
+                "send",
+                "--config",
+                str(config),
+                "--path",
+                str(image),
+                "--target",
+                "@mychat",
+                "--json",
+                cwd=ROOT,
+            )
+
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            argv = json.loads((cwd / "openclaw-cli-log.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                argv,
+                [
+                    "message",
+                    "send",
+                    "--channel",
+                    "telegram",
+                    "--target",
+                    "@mychat",
+                    "--media",
+                    str(image),
+                    "--message",
+                    "Generated ready.png",
+                    "--force-document",
+                    "--json",
+                ],
+            )
 
 
 if __name__ == "__main__":

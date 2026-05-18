@@ -13,10 +13,13 @@ This project is packaged as a Codex skill and also exposes a Python CLI. It is u
   - `openai-images` for OpenAI-compatible `/images/generations` and `/images/edits`.
   - `responses-image` for `/responses` image-generation-tool routers.
   - `any` for minimal browser-style Responses routers.
+  - `nai` for NovelAI-compatible `/api/ai/generate-image` endpoints.
+  - `idlecloud` for IdleCloud's native submit/poll image job endpoints.
   - `custom-http` for configurable sync or async HTTP APIs.
 - Provider/key round-robin and per-key concurrency limits.
 - Prompt templates with `{{prompt}}`, `{{size}}`, `{{ratio}}`, `{{quality}}`, `{{output_format}}`, and `{{n}}`.
 - Provider compatibility switches such as `append_size_to_prompt`, `codex_cli`, `response_format_b64_json`, `force_responses_stream`, and `responses_stream_partial_images`.
+- Optional Gradio-based local WebUI for submitting jobs and inspecting outputs.
 
 ## Quick Start
 
@@ -79,6 +82,18 @@ targets = ["telegram", "weixin"]
 message_template = "MEDIA:{path}"
 ```
 
+For OpenClaw media delivery, configure the native message CLI route:
+
+```toml
+[send]
+preset = "openclaw"
+targets = ["@mychat"]
+message_template = "Generated {filename}\nMEDIA:{path}"
+
+[send.args]
+channel = "telegram"
+```
+
 Edit from an input image:
 
 ```bash
@@ -99,6 +114,22 @@ python scripts/gen_image_cli.py generate \
   --output-format png \
   --json
 ```
+
+## Optional WebUI
+
+The default install stays CLI-only. Install WebUI dependencies only when you need the local browser panel:
+
+```bash
+pip install -e ".[webui]"
+```
+
+Start it through the CLI:
+
+```bash
+python scripts/gen_image_cli.py webui --open
+```
+
+The WebUI uses the same TOML config, SQLite queue, managed worker, provider routing, and provider capability report as the CLI. Provider-specific settings that do not have direct controls can be passed through the **Extra params JSON** field.
 
 ## Configuration
 

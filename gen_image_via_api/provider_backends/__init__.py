@@ -1,0 +1,47 @@
+from __future__ import annotations
+
+from .legacy import (
+    ImagePayload,
+    ProviderCallError,
+    _auth_headers,
+    _call_custom_http,
+    _call_mock,
+    _call_openai_images,
+    _call_responses_image,
+    _custom_files,
+    _download_image,
+    _effective_params,
+    _effective_prompt,
+    _extract_images,
+    _extract_responses_images,
+    _file_to_data_url,
+    _find_image_values,
+    _find_partial_image_values,
+    _httpx,
+    _is_codex_cli_provider,
+    _key_images_per_request,
+    _load_input_images,
+    _looks_like_base64_image,
+    _payload_from_value,
+    _poll_custom_task,
+    _pop_bool,
+    _request_timeout,
+    _response_error_message,
+    _responses_image_tool,
+    _responses_input,
+    _template_context,
+    _unique_image_values,
+    enabled_keys,
+    request_size_for_key,
+)
+from .registry import call_provider
+
+__all__ = [
+    "ImagePayload",
+    "ProviderCallError",
+    "call_provider",
+    "enabled_keys",
+    "request_size_for_key",
+    "_extract_responses_images",
+    "_responses_image_tool",
+]
