@@ -53,6 +53,29 @@ python scripts/gen_image_cli.py submit \
 
 `submit` returns immediately with a job id. It does not wait for image generation. It still ensures the managed worker is running, so manual `run --watch` startup is unnecessary.
 
+Generate and deliver after success:
+
+```bash
+python scripts/gen_image_cli.py generate \
+  --prompt "A clean product hero image of a ceramic mug" \
+  --out-prefix mug-hero \
+  --send \
+  --send-target telegram \
+  --json
+```
+
+Send existing outputs:
+
+```bash
+python scripts/gen_image_cli.py send \
+  --path output/imagegen/mug-hero.png \
+  --target telegram \
+  --target weixin \
+  --json
+```
+
+The `--send` flag and `send` command use the optional `[send]` adapter. See `references/delivery.md`.
+
 ## Output Shape
 
 Default command output is bounded and intended for the common path:
@@ -61,6 +84,7 @@ Default command output is bounded and intended for the common path:
 - `--json` prints compact machine-readable JSON on one line.
 - `submit --json` returns the queued job id, kind/count, provider routing, queue position, and a minimal worker state.
 - `generate --json` and `once` return the final job id, status, kind/count, attempts, and output paths.
+- When `--send` is used, JSON output includes a `send` report with target/path delivery status.
 
 Use `--verbose` with `submit --json`, `generate --json`, `enqueue-batch`, `submit-batch`, or `once` only when debugging. Verbose output restores the full diagnostic payload: prompt, params, runtime/worker state, capacity reports, recent events, result metadata, and queue summaries.
 

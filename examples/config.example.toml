@@ -25,6 +25,18 @@ name = "Cinematic wrapper"
 enabled = false
 body = "Style: cinematic, high detail.\n\n{{prompt}}\n\nRequested size: {{size}} ({{ratio}})."
 
+[send]
+# Optional adapter used by `generate --send`, `once --send`, and `send`.
+# For Python adapters, module.function receives one dict per output file/target.
+# For command adapters, command argv items may use {path}, {target}, and {message}.
+method = "python-call"
+module = ""
+function = ""
+targets = []
+message_template = "MEDIA:{path}"
+retry_delays = [2, 5, 10]
+delay_seconds = 0
+
 [[providers]]
 id = "mock-local"
 type = "mock"

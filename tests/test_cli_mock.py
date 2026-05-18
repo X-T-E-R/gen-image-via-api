@@ -268,6 +268,117 @@ class MockCliTests(unittest.TestCase):
             finally:
                 self.run_cli("stop-worker", "--config", str(config), cwd=ROOT, check=False)
 
+    def test_generate_can_send_outputs_with_python_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            cwd = Path(raw)
+            config = cwd / "gen-image.toml"
+            sender = cwd / "fake_sender.py"
+            sender.write_text(
+                "\n".join(
+                    [
+                        "import json",
+                        "from pathlib import Path",
+                        "",
+                        "def send_file(args):",
+                        "    log = Path(__file__).with_name('send-log.jsonl')",
+                        "    with log.open('a', encoding='utf-8') as fh:",
+                        "        fh.write(json.dumps(args, sort_keys=True) + '\\n')",
+                        "    return {'ok': True, 'target': args.get('target')}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            self.run_cli("init-config", "--out", str(config), cwd=cwd)
+            text = config.read_text(encoding="utf-8")
+            text = text.replace('module = ""', 'module = "fake_sender"')
+            text = text.replace('function = ""', 'function = "send_file"')
+            text = text.replace("retry_delays = [2, 5, 10]", "retry_delays = []")
+            config.write_text(text, encoding="utf-8")
+            try:
+                result = self.run_cli(
+                    "generate",
+                    "--config",
+                    str(config),
+                    "--prompt",
+                    "send smoke",
+                    "--out-prefix",
+                    "send-smoke",
+                    "--send",
+                    "--send-target",
+                    "telegram",
+                    "--json",
+                    "--poll-interval",
+                    "0.1",
+                    cwd=ROOT,
+                )
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["status"], "succeeded")
+                self.assertTrue(payload["send"]["ok"])
+                self.assertEqual(payload["send"]["targets"], ["telegram"])
+                self.assertEqual(payload["send"]["count"], 1)
+                log_lines = (cwd / "send-log.jsonl").read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(log_lines), 1)
+                sent = json.loads(log_lines[0])
+                self.assertEqual(sent["action"], "send")
+                self.assertEqual(sent["target"], "telegram")
+                self.assertTrue(sent["message"].startswith("MEDIA:"))
+                self.assertTrue(Path(sent["path"]).exists())
+            finally:
+                self.run_cli("stop-worker", "--config", str(config), cwd=ROOT, check=False)
+
+    def test_send_command_sends_existing_file_to_multiple_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            cwd = Path(raw)
+            config = cwd / "gen-image.toml"
+            sender = cwd / "fake_sender.py"
+            sender.write_text(
+                "\n".join(
+                    [
+                        "import json",
+                        "from pathlib import Path",
+                        "",
+                        "def send_file(args):",
+                        "    log = Path(__file__).with_name('send-log.jsonl')",
+                        "    with log.open('a', encoding='utf-8') as fh:",
+                        "        fh.write(json.dumps(args, sort_keys=True) + '\\n')",
+                        "    return json.dumps({'ok': True})",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            image = cwd / "ready.png"
+            image.write_bytes(b"image")
+            self.run_cli("init-config", "--out", str(config), cwd=cwd)
+            text = config.read_text(encoding="utf-8")
+            text = text.replace('module = ""', 'module = "fake_sender"')
+            text = text.replace('function = ""', 'function = "send_file"')
+            text = text.replace("retry_delays = [2, 5, 10]", "retry_delays = []")
+            config.write_text(text, encoding="utf-8")
+
+            result = self.run_cli(
+                "send",
+                "--config",
+                str(config),
+                "--path",
+                str(image),
+                "--target",
+                "telegram",
+                "--target",
+                "weixin",
+                "--json",
+                cwd=ROOT,
+            )
+
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["targets"], ["telegram", "weixin"])
+            self.assertEqual(payload["count"], 2)
+            sent_targets = [
+                json.loads(line)["target"]
+                for line in (cwd / "send-log.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(sent_targets, ["telegram", "weixin"])
+
 
 if __name__ == "__main__":
     unittest.main()

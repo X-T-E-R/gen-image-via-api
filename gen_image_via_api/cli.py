@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 from .config import DEFAULT_CONFIG_NAME, ConfigError, load_config, resolve_config_path, write_example_config
+from .delivery import SendError, send_paths
 from .queue import ImageQueue, JobRecord
 from .prompting import render_prompt_template
 from .service import ensure_worker, serve_forever, stop_worker, worker_status
@@ -353,6 +354,20 @@ def _job_summary(job: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _paths_from_job_payload(job: dict[str, Any]) -> list[str]:
+    return [str(item["path"]) for item in job.get("results") or [] if item.get("path")]
+
+
+def _send_job_results(config, args: argparse.Namespace, job: dict[str, Any]) -> dict[str, Any]:
+    paths = _paths_from_job_payload(job)
+    return send_paths(
+        config,
+        paths,
+        targets=getattr(args, "send_target", None),
+        message_template=getattr(args, "send_message", None),
+    )
+
+
 def _worker_summary(worker: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {"running": bool(worker.get("running"))}
     for key in ("started", "stale"):
@@ -392,6 +407,8 @@ def _generate_summary(payload: dict[str, Any]) -> dict[str, Any]:
     summary = _job_summary(payload["job"])
     if payload.get("timed_out"):
         summary["timed_out"] = True
+    if payload.get("send"):
+        summary["send"] = payload["send"]
     return summary
 
 
@@ -615,6 +632,16 @@ def _print_human_job_brief(job: dict[str, Any]) -> None:
         print("Outputs:")
         for item in results:
             print(f"  [{item['index']}] {item['path']}")
+
+
+def _print_human_send_report(report: dict[str, Any]) -> None:
+    state = "OK" if report.get("ok") else "FAILED"
+    print(f"Send: {state} | deliveries={report.get('count', 0)}")
+    for item in report.get("deliveries") or []:
+        marker = "ok" if item.get("ok") else "failed"
+        print(f"  - {marker}: {item.get('target')} <- {item.get('path')}")
+        if item.get("error"):
+            print(f"    error: {item['error']}")
 
 
 def _print_human_status(payload: dict[str, Any]) -> None:
@@ -850,10 +877,12 @@ def cmd_once(args: argparse.Namespace) -> int:
         final_job = asyncio.run(worker.run_until_done(job_id))
         full_payload = _job_to_dict(queue, final_job)
         payload = full_payload if getattr(args, "verbose", False) else _job_summary(full_payload)
+        if getattr(args, "send", False) and full_payload["status"] == "succeeded":
+            payload["send"] = _send_job_results(config, args, full_payload)
     finally:
         queue.close()
     _print_json(payload, pretty=bool(getattr(args, "verbose", False)))
-    return 0 if payload["status"] == "succeeded" else 1
+    return 0 if payload["status"] == "succeeded" and payload.get("send", {"ok": True}).get("ok") else 1
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
@@ -891,6 +920,8 @@ def cmd_generate(args: argparse.Namespace) -> int:
             time.sleep(max(0.1, float(args.poll_interval)))
     finally:
         queue.close()
+    if getattr(args, "send", False) and payload["status"] == "succeeded":
+        payload["send"] = _send_job_results(config, args, payload["job"])
     if args.json:
         if getattr(args, "verbose", False):
             _print_json(payload, pretty=True)
@@ -903,7 +934,36 @@ def cmd_generate(args: argparse.Namespace) -> int:
             _print_human_status({"job": payload["job"]})
         else:
             _print_human_job_brief(payload["job"])
-    return 0 if payload["status"] == "succeeded" else 1
+        if payload.get("send"):
+            _print_human_send_report(payload["send"])
+    return 0 if payload["status"] == "succeeded" and payload.get("send", {"ok": True}).get("ok") else 1
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    config = _load_app(args)
+    paths = list(args.path or [])
+    if args.job_id:
+        queue = _queue_for(config)
+        try:
+            job = queue.get_job(args.job_id)
+            if not job:
+                raise SystemExit(f"Unknown job: {args.job_id}")
+            paths.extend(_paths_from_job_payload(_job_to_dict(queue, job)))
+        finally:
+            queue.close()
+    if not paths:
+        raise SystemExit("Nothing to send. Use --path or --job-id.")
+    report = send_paths(
+        config,
+        paths,
+        targets=args.send_target,
+        message_template=args.send_message,
+    )
+    if args.json:
+        _print_json(report, pretty=bool(getattr(args, "verbose", False)))
+    else:
+        _print_human_send_report(report)
+    return 0 if report["ok"] else 1
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -1101,6 +1161,12 @@ def add_job_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--priority", type=int, default=0)
 
 
+def add_send_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--send", action="store_true", help="Send completed output files using the [send] adapter")
+    parser.add_argument("--send-target", action="append", help="Delivery target. Repeat to send to multiple targets.")
+    parser.add_argument("--send-message", help="Override [send].message_template for this command")
+
+
 def add_autostart_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--no-start-worker",
@@ -1146,6 +1212,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--verbose", action="store_true", help="Include full diagnostics instead of the compact result.")
     generate.add_argument("--poll-interval", type=float, default=2.0)
     generate.add_argument("--timeout-seconds", type=float, default=0.0, help="0 means wait indefinitely")
+    add_send_args(generate)
     generate.set_defaults(func=cmd_generate)
 
     batch = sub.add_parser("enqueue-batch", help="Add jobs from a JSONL file")
@@ -1185,7 +1252,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_config_arg(once)
     add_job_args(once)
     once.add_argument("--verbose", action="store_true", help="Include full diagnostics instead of the compact result.")
+    add_send_args(once)
     once.set_defaults(func=cmd_once)
+
+    send = sub.add_parser("send", help="Send existing output files using the configured delivery adapter")
+    add_config_arg(send)
+    send.add_argument("--path", action="append", help="File path to send. Repeat for multiple files.")
+    send.add_argument("--job-id", help="Send all output files recorded for a completed job.")
+    send.add_argument("--target", "--send-target", dest="send_target", action="append", help="Delivery target. Repeat for multiple targets.")
+    send.add_argument("--message", "--send-message", dest="send_message", help="Override [send].message_template for this command")
+    send.add_argument("--json", action="store_true")
+    send.add_argument("--verbose", action="store_true", help="Pretty-print JSON output.")
+    send.set_defaults(func=cmd_send)
 
     serve = sub.add_parser("serve", help="Run the managed background worker in the foreground")
     add_config_arg(serve)
@@ -1243,6 +1321,9 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
         return 2
+    except SendError as exc:
+        print(f"Send error: {exc}", file=sys.stderr)
+        return 3
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130

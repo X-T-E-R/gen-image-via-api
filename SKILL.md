@@ -46,6 +46,17 @@ python scripts/gen_image_cli.py submit \
 `generate` submits the job, ensures the worker is running, waits for completion, and prints final output paths. `submit` submits the job, ensures the worker is running, and returns immediately with a queued job id. Use `--json` for machine-readable output.
 Default `--json` output is intentionally compact for agent and script consumption: job id, status, count, and output paths. Add `--verbose` when you need full diagnostics such as prompt, params, worker/runtime status, events, result metadata, and capacity details.
 
+Generate and send through a configured delivery adapter:
+
+```bash
+python scripts/gen_image_cli.py generate \
+  --prompt "A clean product hero image of a ceramic mug" \
+  --out-prefix mug-hero \
+  --send \
+  --send-target telegram \
+  --json
+```
+
 Edit or image-to-image from existing images:
 
 ```bash
@@ -66,6 +77,7 @@ python scripts/gen_image_cli.py submit \
    - One or more `--image`: image edit / image-to-image.
 3. Add jobs:
    - Use `generate --json` when final image paths are needed in the same command.
+   - Add `--send --send-target <target>` when successful outputs should be delivered through `[send]`.
    - Use `submit --json` / `submit-batch` when fast return is preferred and results can be checked later.
    - Both commands auto-start or attach to the managed worker. Manual `serve`, `worker`, `run`, or `run --watch` startup is unnecessary.
 4. Inspect outputs:
@@ -109,6 +121,7 @@ python scripts/gen_image_cli.py list --limit 20
 python scripts/gen_image_cli.py status <job_id>
 python scripts/gen_image_cli.py retry <job_id>
 python scripts/gen_image_cli.py cancel <job_id>
+python scripts/gen_image_cli.py send --path output/imagegen/example.png --target telegram --json
 python scripts/gen_image_cli.py stop-worker
 ```
 
@@ -138,6 +151,9 @@ Common direct flags: `--size`, or `--aspect-ratio` plus `--size-tier`, `--output
 
 - `references/cli.md`: command recipes and JSONL batch shape.
 - `references/config.md`: TOML schema, custom HTTP submit/poll/result mappings, key rotation.
+- `references/delivery.md`: optional output delivery adapter for `--send` and the `send` command.
+- `references/api-config-examples.md`: reusable provider/key configuration examples.
+- `references/response-parsing.md`: how provider responses are normalized into output images.
 - `examples/config.example.toml`: safe starter config with `mock`, disabled OpenAI-compatible provider, and custom async HTTP example.
 
 Read CLI source only when debugging or extending the tool itself.

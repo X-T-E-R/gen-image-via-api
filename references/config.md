@@ -71,6 +71,40 @@ Supported placeholders:
 
 Unknown placeholders are left unchanged. If `{{prompt}}` is absent, the raw prompt is appended after a blank line.
 
+## Send Adapter
+
+The optional `[send]` table powers `generate --send`, `once --send`, and the standalone `send` command.
+
+```toml
+[send]
+method = "python-call"
+module = "my_sender"
+function = "send_message"
+targets = ["telegram", "weixin"]
+message_template = "MEDIA:{path}"
+retry_delays = [2, 5, 10]
+delay_seconds = 5
+```
+
+- `method`: `python-call` or `command`.
+- `targets`: default delivery targets when CLI `--send-target` / `--target` is omitted.
+- `message_template`: rendered once per output path. Supports `{path}`, `{filename}`, and `{target}`.
+- `retry_delays`: seconds to wait before retry attempts after a failed send.
+- `delay_seconds`: pause between file/target deliveries. Useful for rate-limited chat platforms.
+
+For `python-call`, `module.function` receives a dict with `action`, `target`, `message`, and `path` by default. The key names can be changed with `action_arg`, `target_arg`, `message_arg`, and `path_arg`.
+
+For `command`, configure argv entries:
+
+```toml
+[send]
+method = "command"
+command = ["python", "send_file.py", "--target", "{target}", "--message", "{message}", "--file", "{path}"]
+targets = ["telegram"]
+```
+
+See `references/delivery.md` for examples and return handling.
+
 ## Provider Fields
 
 ```toml

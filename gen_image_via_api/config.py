@@ -43,6 +43,26 @@ class PromptTemplateConfig:
 
 
 @dataclass(frozen=True)
+class SendConfig:
+    method: str = "python-call"
+    targets: tuple[str, ...] = ()
+    default_target: str | None = None
+    message_template: str = "MEDIA:{path}"
+    module: str = ""
+    function: str = ""
+    command: tuple[str, ...] = ()
+    target_arg: str = "target"
+    message_arg: str = "message"
+    path_arg: str = "path"
+    action_arg: str = "action"
+    action: str = "send"
+    retry_delays: tuple[float, ...] = (2.0, 5.0, 10.0)
+    delay_seconds: float = 0.0
+    timeout_seconds: float = 60.0
+    args: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ProviderKeyConfig:
     id: str
     api_key: str | None = None
@@ -102,6 +122,7 @@ class AppConfig:
     defaults: DefaultsConfig
     providers: tuple[ProviderConfig, ...]
     prompt_templates: tuple[PromptTemplateConfig, ...] = ()
+    send: SendConfig = field(default_factory=SendConfig)
 
     def provider_map(self) -> dict[str, ProviderConfig]:
         return {provider.id: provider for provider in self.providers}
@@ -139,6 +160,24 @@ def _as_str_tuple(value: Any, fallback: tuple[str, ...]) -> tuple[str, ...]:
         items = tuple(str(item).strip() for item in value if str(item).strip())
         return items or fallback
     raise ConfigError(f"Expected string/list value, got {type(value).__name__}")
+
+
+def _as_float_tuple(value: Any, fallback: tuple[float, ...]) -> tuple[float, ...]:
+    if value is None:
+        return fallback
+    if isinstance(value, (int, float, str)):
+        values = (value,)
+    elif isinstance(value, list):
+        values = tuple(value)
+    else:
+        raise ConfigError(f"Expected number/list value, got {type(value).__name__}")
+    parsed: list[float] = []
+    for item in values:
+        try:
+            parsed.append(max(0.0, float(item)))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"Invalid float value: {item}") from exc
+    return tuple(parsed)
 
 
 def _as_bool(value: Any, fallback: bool = False) -> bool:
@@ -309,6 +348,44 @@ def _load_prompt_templates(raw: Any) -> tuple[PromptTemplateConfig, ...]:
     return tuple(unique)
 
 
+def _load_send_config(raw: Any) -> SendConfig:
+    if raw is None:
+        return SendConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("[send] must be a table")
+    command = raw.get("command")
+    if command in (None, ""):
+        command_tuple = ()
+    elif isinstance(command, str):
+        command_tuple = (command,)
+    elif isinstance(command, list):
+        command_tuple = tuple(str(item) for item in command)
+    else:
+        raise ConfigError("[send].command must be a string or list")
+    targets = _as_str_tuple(raw.get("targets"), ())
+    default_target = str(raw["default_target"]) if raw.get("default_target") else None
+    if default_target and not targets:
+        targets = (default_target,)
+    return SendConfig(
+        method=str(raw.get("method") or "python-call"),
+        targets=targets,
+        default_target=default_target,
+        message_template=str(raw.get("message_template") or "MEDIA:{path}"),
+        module=str(raw.get("module") or ""),
+        function=str(raw.get("function") or ""),
+        command=command_tuple,
+        target_arg=str(raw.get("target_arg") or "target"),
+        message_arg=str(raw.get("message_arg") or "message"),
+        path_arg=str(raw.get("path_arg") or "path"),
+        action_arg=str(raw.get("action_arg") or "action"),
+        action=str(raw.get("action") or "send"),
+        retry_delays=_as_float_tuple(raw.get("retry_delays"), (2.0, 5.0, 10.0)),
+        delay_seconds=_as_float(raw.get("delay_seconds"), 0.0, minimum=0.0),
+        timeout_seconds=_as_float(raw.get("timeout_seconds"), 60.0),
+        args=dict(raw.get("args") or {}),
+    )
+
+
 def skill_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -384,6 +461,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     prompt_template_ids = {template.id for template in prompt_templates if template.enabled}
     if defaults.prompt_template and defaults.prompt_template not in prompt_template_ids:
         raise ConfigError(f"defaults.prompt_template references unknown or disabled template: {defaults.prompt_template}")
+    send = _load_send_config(data.get("send"))
 
     return AppConfig(
         path=config_path,
@@ -392,6 +470,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         defaults=defaults,
         providers=providers,
         prompt_templates=prompt_templates,
+        send=send,
     )
 
 
@@ -422,6 +501,19 @@ id = "cinematic"
 name = "Cinematic wrapper"
 enabled = false
 body = "Style: cinematic, high detail.\\n\\n{{prompt}}\\n\\nRequested size: {{size}} ({{ratio}})."
+
+[send]
+# Optional adapter used by `generate --send`, `once --send`, and `send`.
+# `python-call` imports module.function and passes one dict per file/target.
+# Use `command` for a subprocess adapter with {path}, {target}, and {message}
+# placeholders in argv items.
+method = "python-call"
+module = ""
+function = ""
+targets = []
+message_template = "MEDIA:{path}"
+retry_delays = [2, 5, 10]
+delay_seconds = 0
 
 [[providers]]
 id = "mock-local"

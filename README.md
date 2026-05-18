@@ -49,6 +49,27 @@ python scripts/gen_image_cli.py submit \
   --json
 ```
 
+Generate and send outputs through a configured delivery adapter:
+
+```bash
+python scripts/gen_image_cli.py generate \
+  --prompt "A clean product hero image of a ceramic mug" \
+  --out-prefix mug-hero \
+  --send \
+  --send-target telegram \
+  --json
+```
+
+Send existing files:
+
+```bash
+python scripts/gen_image_cli.py send \
+  --path output/imagegen/mug-hero.png \
+  --target telegram \
+  --target weixin \
+  --json
+```
+
 Edit from an input image:
 
 ```bash
@@ -84,6 +105,9 @@ For full schema details, see:
 
 - [`references/config.md`](references/config.md)
 - [`references/cli.md`](references/cli.md)
+- [`references/delivery.md`](references/delivery.md)
+- [`references/api-config-examples.md`](references/api-config-examples.md)
+- [`references/response-parsing.md`](references/response-parsing.md)
 
 ## Development
 
