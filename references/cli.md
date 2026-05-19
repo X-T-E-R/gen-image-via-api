@@ -195,6 +195,15 @@ Provider-specific parameters also have direct flags so common command snippets d
 - `--quality auto|low|medium|high`
 - `--moderation auto|low`
 - `--model <model-id>`
+- `--negative-prompt <text>`
+- `--steps <int>`
+- `--scale <float>`
+- `--seed <int>`
+- `--sampler <name>`
+- `--noise-schedule <name>`
+- `--uc-preset 0|1|2`
+- `--quality-toggle`
+- `--cfg-rescale <float>`
 - `--action auto|generate|edit`
 - `--stream` / `--no-stream`
 
@@ -213,7 +222,31 @@ Values passed through `--param` are parsed as JSON when possible, so `--param se
 
 Run `providers` or `doctor` to see each configured provider's parameter support. The report distinguishes common direct flags, provider-specific direct flags, `--param`-only extras, and values intentionally ignored by that provider type.
 
-Prompt templates are rendered before jobs enter the queue. Supported placeholders are `{{prompt}}`, `{{size}}`, `{{ratio}}`, `{{quality}}`, `{{output_format}}`, and `{{n}}`. Unknown placeholders are preserved. If a template omits `{{prompt}}`, the raw prompt is appended after a blank line.
+NAI / IdleCloud V4 role control is also first-class. Instead of hand-writing `characterPrompts` JSON, use:
+
+- `--use-coords`
+- `--character "<prompt>"` (repeat per character)
+- `--character-uc "<uc>"` (repeat in the same order)
+- `--character-center "x,y"` (repeat in the same order)
+
+When V4 / 4.5 models are selected, the CLI auto-builds `characterPrompts`, `v4_prompt_char_captions`, and `v4_negative_prompt_char_captions`.
+
+```bash
+python scripts/gen_image_cli.py generate \
+  --provider idlecloud \
+  --model nai-diffusion-4-5-full \
+  --prompt "two heroines, full body, clean background" \
+  --negative-prompt "bad anatomy, blurry" \
+  --use-coords \
+  --character "left heroine, white dress" \
+  --character-uc "bad left heroine" \
+  --character-center "0.22,0.34" \
+  --character "right heroine, black jacket" \
+  --character-uc "bad right heroine" \
+  --character-center "0.78,0.34"
+```
+
+Prompt templates are rendered before jobs enter the queue. Prefer `${prompt}` / `${size}` / `${negative_prompt}` for new templates because NovelAI uses plain braces for prompt weighting. Legacy `{{prompt}}` still works for built-in placeholders, and unknown placeholders are preserved. If a template omits `${prompt}` and `{{prompt}}`, the raw prompt is appended after a blank line.
 
 ## Queue Capacity
 

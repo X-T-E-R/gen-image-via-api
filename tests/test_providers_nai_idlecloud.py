@@ -161,6 +161,41 @@ class NaiAndIdleCloudProviderTests(unittest.TestCase):
         self.assertEqual(body["height"], 768)
         self.assertEqual(_FakeAsyncClient.calls[-1][1], "https://api.example/api/get_result/abc")
 
+    def test_idlecloud_passes_v4_character_control_fields_through(self) -> None:
+        import gen_image_via_api.provider_backends.idlecloud as idle_mod
+
+        original_httpx = idle_mod._httpx
+        idle_mod._httpx = lambda: _FakeHttpx
+        try:
+            _FakeAsyncClient.queue = [
+                _FakeResponse(json_data={"job_id": "abc"}),
+                _FakeResponse(json_data={"status": "completed", "image_base64": MOCK_PNG_BASE64}),
+            ]
+            provider = ProviderConfig(id="idle", type="idlecloud", model="nai-diffusion-4-5-full", base_url="https://api.example/api")
+            images = asyncio.run(
+                call_idlecloud(
+                    _config(provider),
+                    provider,
+                    ProviderKeyConfig(id="k", api_key="secret"),
+                    _job(
+                        params={
+                            "use_coords": True,
+                            "characterPrompts": [{"prompt": "left", "uc": "bad left", "center": {"x": 0.2, "y": 0.3}}],
+                            "v4_prompt_char_captions": [{"char_caption": "left", "centers": [{"x": 0.2, "y": 0.3}]}],
+                        }
+                    ),
+                    1,
+                )
+            )
+        finally:
+            idle_mod._httpx = original_httpx
+
+        self.assertEqual(len(images), 1)
+        body = _FakeAsyncClient.calls[0][2]["json"]
+        self.assertTrue(body["use_coords"])
+        self.assertEqual(body["characterPrompts"][0]["prompt"], "left")
+        self.assertEqual(body["v4_prompt_char_captions"][0]["centers"][0]["x"], 0.2)
+
 
 if __name__ == "__main__":
     unittest.main()

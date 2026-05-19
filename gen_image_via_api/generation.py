@@ -84,6 +84,11 @@ def provider_model_choices(config: AppConfig, provider_id: str | None) -> list[s
     return unique
 
 
+def is_nai_v4_model(model: str) -> bool:
+    text = str(model or "").strip().lower()
+    return text.startswith("nai-diffusion-4")
+
+
 def params_for_prompt_render(config: AppConfig, params: dict[str, Any], count: int) -> dict[str, Any]:
     return {
         "size": config.defaults.size,
@@ -93,6 +98,117 @@ def params_for_prompt_render(config: AppConfig, params: dict[str, Any], count: i
         **params,
         "n": count,
     }
+
+
+def parse_character_center(value: Any) -> dict[str, float] | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for separator in (",", ":", "x", "×"):
+        if separator in text:
+            left, right = text.split(separator, 1)
+            try:
+                x = float(left.strip())
+                y = float(right.strip())
+            except ValueError as exc:
+                raise ValueError(f"Invalid character center '{value}'. Use x,y such as 0.25,0.4.") from exc
+            return {"x": x, "y": y}
+    raise ValueError(f"Invalid character center '{value}'. Use x,y such as 0.25,0.4.")
+
+
+def parse_character_rows(value: Any) -> list[dict[str, Any]]:
+    if value in (None, ""):
+        return []
+    if hasattr(value, "to_dict"):
+        rows = value.to_dict(orient="records")
+    else:
+        rows = value
+    normalized: list[dict[str, Any]] = []
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, dict):
+                prompt = str(row.get("prompt") or row.get("character") or "").strip()
+                uc = str(row.get("uc") or row.get("negative") or "").strip()
+                center_obj = row.get("center") if isinstance(row.get("center"), dict) else None
+                x = center_obj.get("x") if center_obj else row.get("x")
+                y = center_obj.get("y") if center_obj else row.get("y")
+            elif isinstance(row, (list, tuple)):
+                prompt = str(row[0] if len(row) > 0 else "").strip()
+                uc = str(row[1] if len(row) > 1 else "").strip()
+                x = row[2] if len(row) > 2 else None
+                y = row[3] if len(row) > 3 else None
+            else:
+                continue
+            if not prompt and not uc and x in (None, "") and y in (None, ""):
+                continue
+            item: dict[str, Any] = {"prompt": prompt, "uc": uc}
+            if x not in (None, "") and y not in (None, ""):
+                item["center"] = {"x": float(x), "y": float(y)}
+            elif x not in (None, "") or y not in (None, ""):
+                raise ValueError("Character rows must include both x and y when either coordinate is set.")
+            normalized.append(item)
+    return normalized
+
+
+def build_character_rows(
+    prompts: list[str] | None,
+    ucs: list[str] | None,
+    centers: list[str] | None,
+) -> list[dict[str, Any]]:
+    prompt_items = [str(item).strip() for item in prompts or [] if str(item).strip()]
+    uc_items = [str(item).strip() for item in ucs or []]
+    center_items = [str(item).strip() for item in centers or []]
+    if not prompt_items:
+        return []
+    if uc_items and len(uc_items) != len(prompt_items):
+        raise ValueError("--character-uc count must match --character count.")
+    if center_items and len(center_items) != len(prompt_items):
+        raise ValueError("--character-center count must match --character count.")
+    rows: list[dict[str, Any]] = []
+    for index, prompt in enumerate(prompt_items):
+        row: dict[str, Any] = {"prompt": prompt, "uc": uc_items[index] if index < len(uc_items) else ""}
+        if index < len(center_items):
+            center = parse_character_center(center_items[index])
+            if center:
+                row["center"] = center
+        rows.append(row)
+    return rows
+
+
+def build_v4_character_params(
+    model: str,
+    characters: list[dict[str, Any]],
+    *,
+    use_coords: bool = False,
+) -> dict[str, Any]:
+    rows = parse_character_rows(characters)
+    if not rows:
+        return {}
+    if not is_nai_v4_model(model):
+        raise ValueError("Character control is currently only available for NAI V4 / 4.5 models.")
+    if use_coords and any("center" not in row for row in rows):
+        raise ValueError("use_coords requires every character row to include both x and y.")
+    payload: dict[str, Any] = {
+        "characterPrompts": [],
+        "v4_prompt_char_captions": [],
+        "v4_negative_prompt_char_captions": [],
+        "use_coords": bool(use_coords),
+    }
+    for row in rows:
+        entry: dict[str, Any] = {"prompt": row.get("prompt", ""), "uc": row.get("uc", "")}
+        center = row.get("center")
+        if center:
+            entry["center"] = center
+        payload["characterPrompts"].append(entry)
+        if center and row.get("prompt"):
+            payload["v4_prompt_char_captions"].append({"char_caption": row["prompt"], "centers": [center]})
+        if center and row.get("uc"):
+            payload["v4_negative_prompt_char_captions"].append({"char_caption": row["uc"], "centers": [center]})
+    if not payload["v4_prompt_char_captions"]:
+        payload.pop("v4_prompt_char_captions")
+    if not payload["v4_negative_prompt_char_captions"]:
+        payload.pop("v4_negative_prompt_char_captions")
+    return payload
 
 
 def selected_template_id(config: AppConfig, template_id: str | None, *, no_template: bool = False) -> str | None:
@@ -149,6 +265,8 @@ def build_job_params(
     uc_preset: Any = None,
     quality_toggle: Any = None,
     cfg_rescale: Any = None,
+    characters: Any = None,
+    use_coords: Any = None,
 ) -> dict[str, Any]:
     params = dict(extra_params) if isinstance(extra_params, dict) else parse_extra_params(str(extra_params or ""))
     if str(size or "").strip():
@@ -181,6 +299,14 @@ def build_job_params(
             params["noise_schedule"] = str(noise_schedule).strip()
         if quality_toggle not in (None, ""):
             params["qualityToggle"] = bool(quality_toggle)
+        effective_provider = selected_provider(config, provider_id)
+        effective_model = str(params.get("model") or (effective_provider.model if effective_provider else "")).strip()
+        character_payload = build_v4_character_params(
+            effective_model,
+            characters if isinstance(characters, list) else parse_character_rows(characters),
+            use_coords=bool(use_coords),
+        )
+        params.update(character_payload)
     return params
 
 

@@ -324,6 +324,7 @@ For this provider:
 - `--image` maps the first input image to `parameters.image` for image-to-image/edit jobs.
 - `--mask` maps to `parameters.mask` for inpaint-style jobs.
 - Use `--param` or `[providers.params]` for NAI-specific knobs such as `negative_prompt`, `seed`, `steps`, `scale`, `sampler`, `noise_schedule`, `ucPreset`, `strength`, and `noise`.
+- For V4 / 4.5 role control, prefer first-class CLI/WebUI inputs over raw JSON. The CLI flags `--character`, `--character-uc`, `--character-center`, and `--use-coords` auto-build `characterPrompts`, `v4_prompt_char_captions`, and `v4_negative_prompt_char_captions`.
 - The response is expected to be a zip or image payload. Zip files are unpacked and image files inside the archive are normalized into job results.
 
 ## IdleCloud Provider
@@ -364,6 +365,7 @@ For this provider:
 - `--image` maps the first input image to `image` as base64 and enables image-to-image fields.
 - `--mask` maps to `mask` and enables inpaint fields.
 - Use `--param` or `[providers.params]` for provider-specific features such as reference image arrays, V4 character captions, `seed`, `steps`, `scale`, `sampler`, `ucPreset`, `strength`, and `noise`.
+- For V4 / 4.5 role control, prefer first-class CLI/WebUI inputs over raw JSON. The CLI flags `--character`, `--character-uc`, `--character-center`, and `--use-coords` auto-build `characterPrompts`, `v4_prompt_char_captions`, and `v4_negative_prompt_char_captions`.
 - The API documents a 20 second request interval and one concurrent task per user, so keep `max_concurrent_requests = 1` unless your account/provider explicitly allows more.
 
 ## Custom HTTP Provider

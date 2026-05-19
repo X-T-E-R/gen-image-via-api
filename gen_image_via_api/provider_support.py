@@ -105,13 +105,14 @@ def provider_parameter_support(provider) -> dict[str, Any]:
         ]
         return {
             "common_cli_params": ["size", "aspect_ratio", "size_tier", "model"],
-            "provider_cli_params": ["model"],
-            "direct_cli_params": ["size", "aspect_ratio", "size_tier", "model"],
+            "provider_cli_params": ["model", "negative_prompt", "steps", "scale", "seed", "sampler", "noise_schedule", "uc_preset", "quality_toggle", "cfg_rescale", "character", "character_uc", "character_center", "use_coords"],
+            "direct_cli_params": ["size", "aspect_ratio", "size_tier", "model", "negative_prompt", "steps", "scale", "seed", "sampler", "noise_schedule", "uc_preset", "quality_toggle", "cfg_rescale", "character", "character_uc", "character_center", "use_coords"],
             "extra_params_via_param": extras,
             "ignored_params": ["quality", "background", "moderation", "output_format", "output_compression", "stream"],
             "notes": [
                 "NAI-compatible endpoint posts to /api/ai/generate-image and extracts images from the returned zip",
                 "use --param for NovelAI-specific generation knobs such as negativePrompt, seed, steps, scale, sampler, and ucPreset",
+                "V4 / 4.5 role control is first-class: use --character, --character-uc, --character-center, and --use-coords to auto-build characterPrompts and V4 caption arrays",
                 "edit jobs map the first --image to the NovelAI image parameter; --mask maps to mask for inpaint-style requests",
                 "keep images_per_request=1 unless the endpoint is known to return multiple images safely",
             ],
@@ -148,14 +149,15 @@ def provider_parameter_support(provider) -> dict[str, Any]:
         ]
         return {
             "common_cli_params": ["size", "aspect_ratio", "size_tier", "model"],
-            "provider_cli_params": ["model"],
-            "direct_cli_params": ["size", "aspect_ratio", "size_tier", "model"],
+            "provider_cli_params": ["model", "negative_prompt", "steps", "scale", "seed", "sampler", "noise_schedule", "uc_preset", "quality_toggle", "cfg_rescale", "character", "character_uc", "character_center", "use_coords"],
+            "direct_cli_params": ["size", "aspect_ratio", "size_tier", "model", "negative_prompt", "steps", "scale", "seed", "sampler", "noise_schedule", "uc_preset", "quality_toggle", "cfg_rescale", "character", "character_uc", "character_center", "use_coords"],
             "extra_params_via_param": extras,
             "ignored_params": ["quality", "background", "moderation", "output_format", "output_compression", "stream", "action"],
             "notes": [
                 "IdleCloud endpoint submits /api/generate_image, polls /api/get_result/{job_id}, and reads image_base64 or image_url",
                 "the API documents a 20 second request interval and one concurrent task per user; configure max_concurrent_requests=1",
                 "use --param for IdleCloud/NAI-specific knobs such as negativePrompt, seed, steps, scale, sampler, reference images, and V4 character controls",
+                "V4 / 4.5 role control is first-class: use --character, --character-uc, --character-center, and --use-coords to auto-build characterPrompts and V4 caption arrays",
                 "edit jobs map the first --image to image=base64; --mask enables inpaint fields",
             ],
         }

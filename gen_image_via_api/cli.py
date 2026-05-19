@@ -14,6 +14,8 @@ from .config import DEFAULT_CONFIG_NAME, ConfigError, load_config, resolve_confi
 from .delivery import SendError, send_paths
 from .generation import (
     apply_prompt_template,
+    build_character_rows,
+    build_job_params,
     normalize_image_size,
     size_from_aspect_ratio,
 )
@@ -52,34 +54,41 @@ def _parse_param(items: list[str] | None, *, flag_name: str = "--param") -> dict
     return params
 
 
-def _params_from_job_args(args: argparse.Namespace) -> dict[str, Any]:
-    params = _parse_param(getattr(args, "param", None))
-    if getattr(args, "size", None):
-        params["size"] = _normalize_image_size(str(args.size))
-    elif getattr(args, "aspect_ratio", None):
-        params["size"] = _size_from_aspect_ratio(args.aspect_ratio, getattr(args, "size_tier", "1K"))
-
-    direct_keys = (
-        "quality",
-        "background",
-        "moderation",
-        "model",
-        "action",
-        "output_compression",
+def _params_from_job_args(config, args: argparse.Namespace) -> dict[str, Any]:
+    params = build_job_params(
+        config,
+        provider_id=getattr(args, "provider", None),
+        extra_params=_parse_param(getattr(args, "param", None)),
+        size=str(getattr(args, "size", "") or ""),
+        aspect_ratio=str(getattr(args, "aspect_ratio", "") or ""),
+        size_tier=str(getattr(args, "size_tier", "1K") or "1K"),
+        model=str(getattr(args, "model", "") or ""),
+        output_format=str(getattr(args, "output_format", "") or ""),
+        quality=str(getattr(args, "quality", "") or ""),
+        background=str(getattr(args, "background", "") or ""),
+        negative_prompt=str(getattr(args, "negative_prompt", "") or ""),
+        steps=getattr(args, "steps", None),
+        scale=getattr(args, "scale", None),
+        seed=getattr(args, "seed", None),
+        sampler=str(getattr(args, "sampler", "") or ""),
+        noise_schedule=str(getattr(args, "noise_schedule", "") or ""),
+        uc_preset=getattr(args, "uc_preset", None),
+        quality_toggle=getattr(args, "quality_toggle", None),
+        cfg_rescale=getattr(args, "cfg_rescale", None),
+        characters=build_character_rows(
+            getattr(args, "character", None),
+            getattr(args, "character_uc", None),
+            getattr(args, "character_center", None),
+        ),
+        use_coords=bool(getattr(args, "use_coords", False)),
     )
-    for key in direct_keys:
+    for key in ("moderation", "action", "output_compression"):
         value = getattr(args, key, None)
         if value is not None:
             params[key] = value
-
-    output_format = getattr(args, "output_format", None)
-    if output_format:
-        params["output_format"] = "jpeg" if output_format == "jpg" else output_format
-
     stream = getattr(args, "stream", None)
     if stream is not None:
         params["stream"] = bool(stream)
-
     return params
 
 
@@ -166,7 +175,7 @@ def _queue_for(config) -> ImageQueue:
 
 def _enqueue_from_args(config, args: argparse.Namespace) -> tuple[str, str, dict[str, int]]:
     kind = "edit" if args.image else "generate"
-    params = _params_from_job_args(args)
+    params = _params_from_job_args(config, args)
     prompt = _prompt_from_job_args(config, args, params)
     queue = _queue_for(config)
     try:
@@ -730,7 +739,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_once(args: argparse.Namespace) -> int:
     config = _load_app(args)
     kind = "edit" if args.image else "generate"
-    params = _params_from_job_args(args)
+    params = _params_from_job_args(config, args)
     prompt = _prompt_from_job_args(config, args, params)
     queue = _queue_for(config)
     try:
@@ -1039,6 +1048,19 @@ def add_job_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--moderation", choices=["auto", "low"])
     parser.add_argument("--output-compression", type=int, help="0-100 compression for jpeg/webp-capable providers")
     parser.add_argument("--model", help="Override provider model for this job when supported")
+    parser.add_argument("--negative-prompt", help="NAI/IdleCloud negative prompt")
+    parser.add_argument("--steps", type=int, help="NAI/IdleCloud steps")
+    parser.add_argument("--scale", type=float, help="NAI/IdleCloud CFG scale")
+    parser.add_argument("--seed", type=int, help="NAI/IdleCloud seed")
+    parser.add_argument("--sampler", help="NAI/IdleCloud sampler")
+    parser.add_argument("--noise-schedule", help="NAI/IdleCloud noise schedule")
+    parser.add_argument("--uc-preset", type=int, choices=[0, 1, 2], help="NAI/IdleCloud ucPreset: 0=Heavy, 1=Light, 2=Human Focus")
+    parser.add_argument("--quality-toggle", action="store_true", default=None, help="NAI/IdleCloud qualityToggle")
+    parser.add_argument("--cfg-rescale", type=float, help="NAI/IdleCloud cfg_rescale / promptGuidanceRescale")
+    parser.add_argument("--use-coords", action="store_true", help="Enable V4 character coordinate mode for NAI/IdleCloud")
+    parser.add_argument("--character", action="append", help="V4 character prompt. Repeat for multiple characters.")
+    parser.add_argument("--character-uc", action="append", help="V4 character UC/negative prompt. Repeat in the same order as --character.")
+    parser.add_argument("--character-center", action="append", help="V4 character center as x,y. Repeat in the same order as --character.")
     parser.add_argument("--action", choices=["auto", "generate", "edit"], help="Responses image tool action when supported")
     parser.add_argument("--stream", dest="stream", action="store_true", default=None)
     parser.add_argument("--no-stream", dest="stream", action="store_false")

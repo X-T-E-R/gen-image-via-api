@@ -13,7 +13,13 @@ from unittest.mock import patch
 
 from gen_image_via_api.config import load_config
 import gen_image_via_api.config as config_mod
-from gen_image_via_api.generation import apply_prompt_template, build_job_params, provider_model_choices
+from gen_image_via_api.generation import (
+    apply_prompt_template,
+    build_character_rows,
+    build_job_params,
+    build_v4_character_params,
+    provider_model_choices,
+)
 from gen_image_via_api.prompting import (
     PROMPT_REWRITE_GUARD_PREFIX,
     append_size_instruction,
@@ -252,6 +258,52 @@ api_key = "secret"
         )
         self.assertEqual(_status_choices("en")[0], ("All statuses", ""))
         self.assertEqual(_tab_label("create_tab"), "创作 / Create")
+
+    def test_nai_v4_character_controls_build_first_class_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = root / "gen-image.toml"
+            config.write_text(
+                """
+[[providers]]
+id = "p"
+type = "idlecloud"
+model = "nai-diffusion-4-5-full"
+
+[[providers.keys]]
+id = "k"
+api_key = "secret"
+""".strip(),
+                encoding="utf-8",
+            )
+            app = load_config(config)
+
+        rows = build_character_rows(
+            ["girl on left", "girl on right"],
+            ["bad left", "bad right"],
+            ["0.2,0.3", "0.8,0.3"],
+        )
+        payload = build_v4_character_params("nai-diffusion-4-5-full", rows, use_coords=True)
+
+        self.assertTrue(payload["use_coords"])
+        self.assertEqual(payload["characterPrompts"][0]["center"], {"x": 0.2, "y": 0.3})
+        self.assertEqual(payload["v4_prompt_char_captions"][1]["char_caption"], "girl on right")
+        self.assertEqual(payload["v4_negative_prompt_char_captions"][0]["char_caption"], "bad left")
+
+        params = build_job_params(
+            app,
+            provider_id="p",
+            model="nai-diffusion-4-5-full",
+            characters=rows,
+            use_coords=True,
+        )
+        self.assertIn("characterPrompts", params)
+        self.assertEqual(params["characterPrompts"][1]["uc"], "bad right")
+
+    def test_character_controls_require_v4_model(self) -> None:
+        rows = build_character_rows(["girl"], ["bad"], ["0.5,0.5"])
+        with self.assertRaises(ValueError):
+            build_v4_character_params("nai-diffusion-3", rows, use_coords=True)
 
     def test_resolve_config_path_uses_skill_config_and_ignores_legacy_user_config(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

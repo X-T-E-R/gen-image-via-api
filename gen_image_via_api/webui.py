@@ -89,6 +89,13 @@ TEXT: dict[str, dict[str, str]] = {
         "uc_preset": "UC Preset",
         "quality_toggle": "Quality Toggle",
         "cfg_rescale": "CFG Rescale",
+        "character_controls": "V4 角色控制",
+        "character_controls_info": "每行一个角色：正向 prompt、负向 uc、x、y。会自动生成 characterPrompts 和两组 V4 caption 数组。",
+        "use_coords": "启用坐标模式",
+        "character_prompt": "角色 Prompt",
+        "character_uc": "角色 UC",
+        "coord_x": "X",
+        "coord_y": "Y",
         "input_images": "输入图片路径",
         "input_images_info": "每行一个本地路径。非空时自动按编辑/图生图任务提交。",
         "mask": "蒙版路径",
@@ -197,6 +204,13 @@ TEXT: dict[str, dict[str, str]] = {
         "uc_preset": "UC Preset",
         "quality_toggle": "Quality Toggle",
         "cfg_rescale": "CFG Rescale",
+        "character_controls": "V4 character control",
+        "character_controls_info": "One character per row: positive prompt, negative uc, x, y. The UI auto-builds characterPrompts and both V4 caption arrays.",
+        "use_coords": "Enable coords mode",
+        "character_prompt": "Character prompt",
+        "character_uc": "Character UC",
+        "coord_x": "X",
+        "coord_y": "Y",
         "input_images": "Input image paths",
         "input_images_info": "One local path per line. Non-empty paths submit an edit/image-to-image job.",
         "mask": "Mask path",
@@ -535,6 +549,20 @@ def build_webui(config: AppConfig, gr):
                                 with gr.Row():
                                     quality_toggle = gr.Checkbox(label=_t(lang0, "quality_toggle"), value=False)
                                     cfg_rescale = gr.Number(label=_t(lang0, "cfg_rescale"), value=0, precision=2, minimum=0)
+                                gr.Markdown(
+                                    f"### {_bilingual_label('character_controls')}\n"
+                                    f"{_t(lang0, 'character_controls_info')} / {_t('en', 'character_controls_info')}"
+                                )
+                                use_coords = gr.Checkbox(label=_t(lang0, "use_coords"), value=False)
+                                character_rows = gr.Dataframe(
+                                    headers=_character_headers(lang0),
+                                    datatype=["str", "str", "number", "number"],
+                                    value=[["", "", "", ""]],
+                                    row_count=(2, "dynamic"),
+                                    col_count=(4, "fixed"),
+                                    interactive=True,
+                                    wrap=True,
+                                )
                             with gr.Row():
                                 out_prefix = gr.Textbox(label=_t(lang0, "out_prefix"), placeholder="hero-shot")
                                 out_dir = gr.Textbox(label=_t(lang0, "out_dir"), placeholder=str(config.queue.output_dir))
@@ -703,6 +731,8 @@ def build_webui(config: AppConfig, gr):
                 uc_preset,
                 quality_toggle,
                 cfg_rescale,
+                use_coords,
+                character_rows,
                 out_prefix,
                 out_dir,
                 input_images,
@@ -771,6 +801,8 @@ def build_webui(config: AppConfig, gr):
                 uc_preset,
                 quality_toggle,
                 cfg_rescale,
+                use_coords,
+                character_rows,
                 extra_params,
                 language,
             ],
@@ -800,6 +832,8 @@ def build_webui(config: AppConfig, gr):
                 uc_preset,
                 quality_toggle,
                 cfg_rescale,
+                use_coords,
+                character_rows,
                 input_images,
                 mask,
                 out_dir,
@@ -845,6 +879,8 @@ def _submit_callback(config: AppConfig, gr):
         uc_preset: int | float,
         quality_toggle: bool,
         cfg_rescale: int | float,
+        use_coords: bool,
+        character_rows: Any,
         input_images: str,
         mask: str,
         out_dir: str,
@@ -876,6 +912,8 @@ def _submit_callback(config: AppConfig, gr):
                 uc_preset=uc_preset,
                 quality_toggle=quality_toggle,
                 cfg_rescale=cfg_rescale,
+                use_coords=use_coords,
+                characters=character_rows,
             )
             final_prompt = apply_prompt_template(config, text, params, max(1, int(count or 1)), template_id=template_id)
         except ValueError as exc:
@@ -936,6 +974,8 @@ def _preview_callback(config: AppConfig, gr):
         uc_preset: int | float,
         quality_toggle: bool,
         cfg_rescale: int | float,
+        use_coords: bool,
+        character_rows: Any,
         extra_params: str,
         lang: str,
     ):
@@ -964,6 +1004,8 @@ def _preview_callback(config: AppConfig, gr):
                 uc_preset=uc_preset,
                 quality_toggle=quality_toggle,
                 cfg_rescale=cfg_rescale,
+                use_coords=use_coords,
+                characters=character_rows,
             )
             final_prompt = apply_prompt_template(config, text, params, max(1, int(count or 1)), template_id=template_id)
         except ValueError as exc:
@@ -1116,6 +1158,8 @@ def _language_callback(config: AppConfig, gr):
             gr.update(label=_t(lang, "uc_preset")),
             gr.update(label=_t(lang, "quality_toggle")),
             gr.update(label=_t(lang, "cfg_rescale")),
+            gr.update(label=_t(lang, "use_coords")),
+            gr.update(headers=_character_headers(lang)),
             gr.update(label=_t(lang, "out_prefix")),
             gr.update(label=_t(lang, "out_dir")),
             gr.update(label=_t(lang, "input_images"), info=_t(lang, "input_images_info")),
@@ -1225,6 +1269,15 @@ def _template_rows(config: AppConfig) -> list[list[Any]]:
     return [[template.id, template.name or template.id, template.enabled] for template in config.prompt_templates]
 
 
+def _character_headers(lang: str = "zh") -> list[str]:
+    return [
+        _t(lang, "character_prompt"),
+        _t(lang, "character_uc"),
+        _t(lang, "coord_x"),
+        _t(lang, "coord_y"),
+    ]
+
+
 def _status_choices(lang: str = "zh") -> list[tuple[str, str]]:
     return [
         (_t(lang, "all_status"), ""),
@@ -1300,6 +1353,8 @@ def _params_from_form(
     uc_preset: Any = None,
     quality_toggle: Any = None,
     cfg_rescale: Any = None,
+    use_coords: Any = None,
+    characters: Any = None,
 ) -> dict[str, Any]:
     return build_job_params(
         config,
@@ -1321,6 +1376,8 @@ def _params_from_form(
         uc_preset=uc_preset,
         quality_toggle=quality_toggle,
         cfg_rescale=cfg_rescale,
+        use_coords=use_coords,
+        characters=characters,
     )
 
 

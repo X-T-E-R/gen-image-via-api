@@ -241,6 +241,63 @@ class MockCliTests(unittest.TestCase):
             prompt = json.loads(status.stdout)["job"]["prompt"]
             self.assertEqual(prompt, "Style: high / 1536x1024 / 3:2 / 2\n\ntemplate smoke")
 
+    def test_submit_builds_first_class_idlecloud_character_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            cwd = Path(raw)
+            config = cwd / "gen-image.toml"
+            config.write_text(
+                """
+[queue]
+db = ".gen-image-queue/queue.sqlite3"
+output_dir = "output/imagegen"
+
+[[providers]]
+id = "mock-local"
+type = "idlecloud"
+model = "nai-diffusion-4-5-full"
+
+[[providers.keys]]
+id = "idle-key"
+api_key = "secret"
+""".strip(),
+                encoding="utf-8",
+            )
+
+            result = self.run_cli(
+                "submit",
+                "--config",
+                str(config),
+                "--prompt",
+                "character smoke",
+                "--no-start-worker",
+                "--provider",
+                "mock-local",
+                "--model",
+                "nai-diffusion-4-5-full",
+                "--use-coords",
+                "--character",
+                "left hero",
+                "--character-uc",
+                "bad left",
+                "--character-center",
+                "0.2,0.3",
+                "--character",
+                "right hero",
+                "--character-uc",
+                "bad right",
+                "--character-center",
+                "0.8,0.3",
+                "--json",
+                cwd=cwd,
+            )
+            job_id = json.loads(result.stdout)["job_id"]
+            status = self.run_cli("status", "--config", str(config), job_id, "--json", cwd=cwd)
+            params = json.loads(status.stdout)["job"]["params"]
+            self.assertTrue(params["use_coords"])
+            self.assertEqual(params["characterPrompts"][0]["prompt"], "left hero")
+            self.assertEqual(params["characterPrompts"][1]["center"], {"x": 0.8, "y": 0.3})
+            self.assertEqual(params["v4_negative_prompt_char_captions"][1]["char_caption"], "bad right")
+
     def test_submit_autostarts_worker(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             cwd = Path(raw)
