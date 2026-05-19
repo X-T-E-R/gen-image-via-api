@@ -10,3 +10,6 @@ gen-image.toml
 .tmp/
 .decision/
 .workflow/
+/.playwright-mcp/
+/gen-image-studio-webui*.png
+/webui-*.png

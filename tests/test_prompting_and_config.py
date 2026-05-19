@@ -18,7 +18,17 @@ from gen_image_via_api.prompting import (
     append_size_instruction,
     render_prompt_template,
 )
-from gen_image_via_api.webui import MISSING_WEBUI_DEPS_MESSAGE, serve_webui
+from gen_image_via_api.webui import (
+    MISSING_WEBUI_DEPS_MESSAGE,
+    TEMPLATE_DEFAULT,
+    TEMPLATE_NONE,
+    _render_prompt_for_template,
+    _status_choices,
+    _tab_label,
+    _template_body,
+    _template_choices,
+    serve_webui,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -172,6 +182,49 @@ type = "mock"
 
         self.assertEqual(code, 2)
         self.assertIn(MISSING_WEBUI_DEPS_MESSAGE, stderr.getvalue())
+
+    def test_webui_template_helpers_support_default_none_and_bilingual_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = root / "gen-image.toml"
+            config.write_text(
+                """
+[defaults]
+prompt_template = "wrap"
+
+[[prompt_templates]]
+id = "wrap"
+name = "Wrapper"
+body = "Wrap {{n}} {{size}} {{prompt}}"
+
+[[prompt_templates]]
+id = "disabled"
+enabled = false
+body = "disabled"
+
+[[providers]]
+id = "p"
+type = "mock"
+""".strip(),
+                encoding="utf-8",
+            )
+            app = load_config(config)
+
+        zh_choices = _template_choices(app, "zh")
+        en_choices = _template_choices(app, "en")
+
+        self.assertEqual(zh_choices[0], ("使用配置默认模板", TEMPLATE_DEFAULT))
+        self.assertEqual(en_choices[1], ("No template", TEMPLATE_NONE))
+        self.assertIn(("Wrapper · wrap", "wrap"), zh_choices)
+        self.assertNotIn(("disabled · disabled", "disabled"), zh_choices)
+        self.assertIn("Wrapper", _template_body(app, TEMPLATE_DEFAULT, "zh"))
+        self.assertEqual(
+            _render_prompt_for_template(app, "a fox", {"size": "1536x1024"}, 2, TEMPLATE_DEFAULT, "en"),
+            "Wrap 2 1536x1024 a fox",
+        )
+        self.assertEqual(_render_prompt_for_template(app, "raw", {}, 1, TEMPLATE_NONE, "en"), "raw")
+        self.assertEqual(_status_choices("en")[0], ("All statuses", ""))
+        self.assertEqual(_tab_label("create_tab"), "创作 / Create")
 
     def test_resolve_config_path_uses_skill_config_and_ignores_legacy_user_config(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
