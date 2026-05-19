@@ -55,21 +55,33 @@ prompt_template = ""
 id = "cinematic"
 name = "Cinematic wrapper"
 enabled = true
-body = "Style: cinematic.\\n\\n{{prompt}}\\n\\nRequested size: {{size}} ({{ratio}})."
+body = "Style: cinematic.\\n\\n${prompt}\\n\\nRequested size: ${size} (${ratio})."
+
+[[prompt_templates]]
+id = "nai-negative"
+name = "NAI negative prompt"
+enabled = true
+body = "${prompt}"
+[prompt_templates.params]
+negative_prompt = "blurry, lowres, error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, multiple views, logo, too many watermarks, tiara, coat, futa, poorly drawn, lowers, blurry, bokeh, worst quality, low quality, out of focus, ugly, error, jpeg artifacts, {{{{censor, bar censor}}}}, mosaic censorship, puffy nipples, extra digits, POV hands, hutanari, worst quality, low quality:1.4), lowres, text, bad anatomy, text, logo, watermark, extra fingers, missing fingers, extra arms, missing arms, extra legs, extra legs, counter, body writing"
 ```
 
 Templates are applied before jobs are written to the queue. CLI `--template <id>` overrides the default for one job, and `--no-template` bypasses the default. Batch JSONL items can use `template` or `prompt_template`.
 
-Supported placeholders:
+Prompt `body` and `[prompt_templates.params]` string values share the same placeholder renderer. Prefer `${name}` for new templates because NovelAI uses plain braces in positive prompts for weighting. Legacy `{{name}}` still works when it is exactly two braces, while NAI weight braces such as `{{{tag}}}` are preserved.
 
-- `{{prompt}}`
-- `{{size}}`
-- `{{ratio}}`
-- `{{quality}}`
-- `{{output_format}}`
-- `{{n}}`
+Supported built-in placeholders:
 
-Unknown placeholders are left unchanged. If `{{prompt}}` is absent, the raw prompt is appended after a blank line.
+- `${prompt}` / `{{prompt}}`
+- `${size}` / `{{size}}`
+- `${ratio}` / `{{ratio}}`
+- `${quality}` / `{{quality}}`
+- `${output_format}` / `{{output_format}}`
+- `${n}` / `{{n}}`
+
+Any job parameter can also be referenced by name, such as `${negative_prompt}`, `${model}`, `${steps}`, `${scale}`, or `${sampler}`.
+
+Unknown placeholders are left unchanged. If neither `${prompt}` nor `{{prompt}}` is present, the raw prompt is appended after a blank line.
 
 ## Send Adapter
 
@@ -156,6 +168,7 @@ id = "openai-main"
 type = "openai-images"
 base_url = "https://api.openai.com/v1"
 model = "gpt-image-2"
+models = ["gpt-image-2"]
 enabled = true
 priority = 10
 capabilities = ["generate", "edit"]
@@ -184,6 +197,7 @@ Provider compatibility switches:
 - `append_size_to_prompt`: appends `Output size instruction: use size ... and aspect ratio ...` to the submitted prompt. This helps routers that ignore structured `size`.
 - `force_responses_stream`: for `responses-image` / `any`, forces `stream = true` even when a job passes `--no-stream`.
 - `responses_stream_partial_images`: for `responses-image` / `any`, adds `partial_images` to the image generation tool. Values are clamped to `0..3`.
+- `models`: optional UI-facing model choices for this provider. The CLI still accepts `--model` or `--param model=...`; WebUI uses this list for the global model selector. NAI and IdleCloud providers also include `nai-diffusion-3`, `nai-diffusion-4-full`, and `nai-diffusion-4-5-full` as documented IdleCloud image models.
 
 Provider selection:
 
@@ -283,6 +297,7 @@ id = "nai-idlecloud"
 type = "nai"
 base_url = "https://api.idlecloud.cc/api"
 model = "nai-diffusion-4-5-full"
+models = ["nai-diffusion-3", "nai-diffusion-4-full", "nai-diffusion-4-5-full"]
 enabled = true
 priority = 16
 capabilities = ["generate", "edit"]
@@ -321,6 +336,7 @@ id = "idlecloud"
 type = "idlecloud"
 base_url = "https://api.idlecloud.cc/api"
 model = "nai-diffusion-4-5-full"
+models = ["nai-diffusion-3", "nai-diffusion-4-full", "nai-diffusion-4-5-full"]
 enabled = true
 priority = 15
 capabilities = ["generate", "edit"]

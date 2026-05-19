@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import html
-import json
 from pathlib import Path
 import sys
 from typing import Any
 
 from .config import AppConfig
-from .prompting import render_prompt_template
+from .generation import (
+    NOISE_SCHEDULES,
+    SAMPLERS,
+    apply_prompt_template,
+    build_job_params,
+    is_nai_like_provider,
+    is_openai_like_provider,
+    provider_model_choices,
+    selected_template_id as core_selected_template_id,
+)
 from .provider_support import provider_parameter_support
 from .queue import ImageQueue, JobRecord
 from .service import ensure_worker, worker_status
@@ -34,6 +42,8 @@ TEXT: dict[str, dict[str, str]] = {
         "language": "语言",
         "provider": "Provider",
         "provider_status": "Provider 状态",
+        "context": "全局上下文",
+        "context_info": "Provider 与模型会影响下方可用字段；队列任务仍使用同一套 CLI 路由。",
         "create_tab": "创作",
         "templates_tab": "模板",
         "queue_tab": "队列",
@@ -62,10 +72,23 @@ TEXT: dict[str, dict[str, str]] = {
         "size": "尺寸",
         "aspect_ratio": "比例",
         "size_tier": "尺寸档位",
-        "model": "模型覆盖",
+        "model": "模型",
+        "model_info": "选择当前任务的模型；空值表示使用 provider 配置默认值。",
         "output_format": "输出格式",
         "quality": "质量",
         "background": "背景",
+        "openai_fields": "OpenAI / Responses 字段",
+        "nai_fields": "NAI / IdleCloud 字段",
+        "negative_prompt": "负面提示词",
+        "negative_prompt_info": "会写入 negative_prompt/negativePrompt；可由模板自动填入。",
+        "steps": "步数",
+        "scale": "CFG Scale",
+        "seed": "Seed",
+        "sampler": "采样器",
+        "noise_schedule": "噪声调度",
+        "uc_preset": "UC Preset",
+        "quality_toggle": "Quality Toggle",
+        "cfg_rescale": "CFG Rescale",
         "input_images": "输入图片路径",
         "input_images_info": "每行一个本地路径。非空时自动按编辑/图生图任务提交。",
         "mask": "蒙版路径",
@@ -127,6 +150,8 @@ TEXT: dict[str, dict[str, str]] = {
         "language": "Language",
         "provider": "Provider",
         "provider_status": "Provider status",
+        "context": "Global context",
+        "context_info": "Provider and model change which fields are available below; queued jobs still use the same CLI routing.",
         "create_tab": "Create",
         "templates_tab": "Templates",
         "queue_tab": "Queue",
@@ -155,10 +180,23 @@ TEXT: dict[str, dict[str, str]] = {
         "size": "Size",
         "aspect_ratio": "Aspect ratio",
         "size_tier": "Size tier",
-        "model": "Model override",
+        "model": "Model",
+        "model_info": "Choose a model for this job; empty means the provider default from config.",
         "output_format": "Output format",
         "quality": "Quality",
         "background": "Background",
+        "openai_fields": "OpenAI / Responses fields",
+        "nai_fields": "NAI / IdleCloud fields",
+        "negative_prompt": "Negative prompt",
+        "negative_prompt_info": "Written as negative_prompt/negativePrompt; templates can fill it automatically.",
+        "steps": "Steps",
+        "scale": "CFG Scale",
+        "seed": "Seed",
+        "sampler": "Sampler",
+        "noise_schedule": "Noise schedule",
+        "uc_preset": "UC Preset",
+        "quality_toggle": "Quality Toggle",
+        "cfg_rescale": "CFG Rescale",
         "input_images": "Input image paths",
         "input_images_info": "One local path per line. Non-empty paths submit an edit/image-to-image job.",
         "mask": "Mask path",
@@ -302,6 +340,16 @@ CSS = """
 .studio-language .wrap {
   gap: 6px !important;
 }
+.studio-context {
+  border: 1px solid var(--studio-line) !important;
+  border-radius: 22px !important;
+  background: rgba(255,255,255,.82) !important;
+  box-shadow: 0 12px 32px rgba(38, 43, 38, .06) !important;
+  margin-bottom: 12px !important;
+}
+.studio-context .form {
+  border: 0 !important;
+}
 .studio-panel {
   border: 1px solid var(--studio-line) !important;
   border-radius: 22px !important;
@@ -379,6 +427,8 @@ def build_webui(config: AppConfig, gr):
 
     with gr.Blocks(title="Gen Image Studio", theme=theme, css=CSS, fill_width=True) as demo:
         with gr.Column(elem_classes=["studio-shell"]):
+            initial_provider = config.defaults.provider or ""
+            initial_model = ""
             with gr.Row(equal_height=True):
                 with gr.Column(scale=9, min_width=520):
                     header = gr.HTML(_topbar_html(config, lang0))
@@ -398,26 +448,36 @@ def build_webui(config: AppConfig, gr):
             )
             limit = gr.Number(label=_t(lang0, "limit"), value=20, precision=0, minimum=1, visible=False)
 
+            with gr.Row(equal_height=True, variant="panel", elem_classes=["studio-context"]):
+                with gr.Column(scale=3, min_width=220):
+                    context_heading = gr.Markdown(f"### {_t(lang0, 'context')}\n{_t(lang0, 'context_info')}")
+                with gr.Column(scale=3, min_width=260):
+                    provider = gr.Dropdown(
+                        label=_t(lang0, "provider"),
+                        choices=_provider_choices(config, lang0),
+                        value=initial_provider,
+                        allow_custom_value=False,
+                    )
+                with gr.Column(scale=4, min_width=300):
+                    model = gr.Dropdown(
+                        label=_t(lang0, "model"),
+                        info=_t(lang0, "model_info"),
+                        choices=_model_choices(config, initial_provider, lang0),
+                        value=initial_model,
+                        allow_custom_value=True,
+                    )
+
             with gr.Tabs(elem_classes=["studio-tabs"]):
                 with gr.Tab(_tab_label("create_tab")):
                     with gr.Row(equal_height=False):
                         with gr.Column(scale=7, min_width=500, variant="panel", elem_classes=["studio-panel"]):
                             create_heading = gr.Markdown(f"## {_t(lang0, 'create_tab')}", elem_classes=["studio-section-title"])
-                            with gr.Row():
-                                provider = gr.Dropdown(
-                                    label=_t(lang0, "provider"),
-                                    choices=_provider_choices(config, lang0),
-                                    value="",
-                                    allow_custom_value=False,
-                                    scale=2,
-                                )
-                                template = gr.Dropdown(
-                                    label=_t(lang0, "template"),
-                                    choices=_template_choices(config, lang0),
-                                    value=TEMPLATE_DEFAULT,
-                                    allow_custom_value=False,
-                                    scale=2,
-                                )
+                            template = gr.Dropdown(
+                                label=_t(lang0, "template"),
+                                choices=_template_choices(config, lang0),
+                                value=TEMPLATE_DEFAULT,
+                                allow_custom_value=False,
+                            )
                             prompt = gr.Textbox(
                                 label=_t(lang0, "prompt"),
                                 info=_t(lang0, "prompt_info"),
@@ -446,16 +506,35 @@ def build_webui(config: AppConfig, gr):
                             with gr.Row():
                                 size = gr.Textbox(label=_t(lang0, "size"), placeholder=config.defaults.size or "1024x1024")
                                 aspect_ratio = gr.Textbox(label=_t(lang0, "aspect_ratio"), placeholder="16:9, 1:1, portrait")
-                            with gr.Row():
-                                model = gr.Textbox(label=_t(lang0, "model"), placeholder="optional")
-                                output_format = gr.Dropdown(
-                                    label=_t(lang0, "output_format"),
-                                    choices=["", "png", "jpeg", "webp"],
-                                    value="",
+                            with gr.Column(visible=is_openai_like_provider(config, initial_provider)) as openai_group:
+                                gr.Markdown(f"### {_bilingual_label('openai_fields')}")
+                                with gr.Row():
+                                    output_format = gr.Dropdown(
+                                        label=_t(lang0, "output_format"),
+                                        choices=["", "png", "jpeg", "webp"],
+                                        value="",
+                                    )
+                                    quality = gr.Dropdown(label=_t(lang0, "quality"), choices=["", "auto", "low", "medium", "high"], value="")
+                                    background = gr.Dropdown(label=_t(lang0, "background"), choices=["", "auto", "transparent", "opaque"], value="")
+                            with gr.Column(visible=is_nai_like_provider(config, initial_provider)) as nai_group:
+                                gr.Markdown(f"### {_bilingual_label('nai_fields')}")
+                                negative_prompt = gr.Textbox(
+                                    label=_t(lang0, "negative_prompt"),
+                                    info=_t(lang0, "negative_prompt_info"),
+                                    lines=5,
+                                    placeholder="lowres, bad anatomy, bad quality",
                                 )
-                            with gr.Row():
-                                quality = gr.Dropdown(label=_t(lang0, "quality"), choices=["", "auto", "low", "medium", "high"], value="")
-                                background = gr.Dropdown(label=_t(lang0, "background"), choices=["", "auto", "transparent", "opaque"], value="")
+                                with gr.Row():
+                                    steps = gr.Number(label=_t(lang0, "steps"), value=28, precision=0, minimum=1)
+                                    scale = gr.Number(label=_t(lang0, "scale"), value=5, precision=2, minimum=0)
+                                    seed = gr.Number(label=_t(lang0, "seed"), value=0, precision=0, minimum=0)
+                                with gr.Row():
+                                    sampler = gr.Dropdown(label=_t(lang0, "sampler"), choices=list(SAMPLERS), value="k_euler", allow_custom_value=True)
+                                    noise_schedule = gr.Dropdown(label=_t(lang0, "noise_schedule"), choices=list(NOISE_SCHEDULES), value="karras", allow_custom_value=True)
+                                    uc_preset = gr.Dropdown(label=_t(lang0, "uc_preset"), choices=[("Heavy", 0), ("Light", 1), ("Human Focus", 2)], value=1)
+                                with gr.Row():
+                                    quality_toggle = gr.Checkbox(label=_t(lang0, "quality_toggle"), value=False)
+                                    cfg_rescale = gr.Number(label=_t(lang0, "cfg_rescale"), value=0, precision=2, minimum=0)
                             with gr.Row():
                                 out_prefix = gr.Textbox(label=_t(lang0, "out_prefix"), placeholder="hero-shot")
                                 out_dir = gr.Textbox(label=_t(lang0, "out_dir"), placeholder=str(config.queue.output_dir))
@@ -585,27 +664,22 @@ def build_webui(config: AppConfig, gr):
                                 max_height=420,
                             )
                         with gr.Column(scale=6, min_width=500, variant="panel", elem_classes=["studio-panel"]):
-                            provider_catalog = gr.Dropdown(
-                                label=_t(lang0, "provider"),
-                                choices=_provider_choices(config, lang0),
-                                value="",
-                                allow_custom_value=False,
-                            )
-                            provider_info = gr.Markdown(_provider_markdown(config, "", lang0), elem_classes=["studio-card"])
+                            provider_info = gr.Markdown(_provider_markdown(config, initial_provider, lang0), elem_classes=["studio-card"])
                             provider_config_info = gr.Markdown(_config_markdown(config, lang0))
 
         language.change(
             _language_callback(config, gr),
-            inputs=[language, provider, template],
+            inputs=[language, provider, template, model],
             outputs=[
                 header,
                 worker_state,
                 provider,
-                provider_catalog,
+                model,
                 template,
                 template_catalog,
                 provider_info,
                 provider_config_info,
+                context_heading,
                 create_heading,
                 generation_heading,
                 templates_heading,
@@ -617,10 +691,18 @@ def build_webui(config: AppConfig, gr):
                 size_tier,
                 size,
                 aspect_ratio,
-                model,
                 output_format,
                 quality,
                 background,
+                negative_prompt,
+                steps,
+                scale,
+                seed,
+                sampler,
+                noise_schedule,
+                uc_preset,
+                quality_toggle,
+                cfg_rescale,
                 out_prefix,
                 out_dir,
                 input_images,
@@ -649,8 +731,11 @@ def build_webui(config: AppConfig, gr):
                 provider_table,
             ],
         )
-        provider.change(_provider_change_callback(config, gr), inputs=[provider, language], outputs=[provider_info, provider_catalog])
-        provider_catalog.change(_provider_catalog_change_callback(config, gr), inputs=[provider_catalog, language], outputs=[provider, provider_info])
+        provider.change(
+            _provider_change_callback(config, gr),
+            inputs=[provider, language, model],
+            outputs=[provider_info, model, openai_group, nai_group],
+        )
         template.change(_template_change_callback(config, gr), inputs=[template, language], outputs=[template_catalog, template_body, rendered_prompt, template_preview])
         template_catalog.change(_template_catalog_change_callback(config, gr), inputs=[template_catalog, language], outputs=[template, template_body, rendered_prompt, template_preview])
         template_preview_button.click(
@@ -668,12 +753,24 @@ def build_webui(config: AppConfig, gr):
             inputs=[
                 prompt,
                 template,
+                provider,
                 count,
                 size,
                 aspect_ratio,
                 size_tier,
+                model,
                 output_format,
                 quality,
+                background,
+                negative_prompt,
+                steps,
+                scale,
+                seed,
+                sampler,
+                noise_schedule,
+                uc_preset,
+                quality_toggle,
+                cfg_rescale,
                 extra_params,
                 language,
             ],
@@ -694,6 +791,15 @@ def build_webui(config: AppConfig, gr):
                 output_format,
                 quality,
                 background,
+                negative_prompt,
+                steps,
+                scale,
+                seed,
+                sampler,
+                noise_schedule,
+                uc_preset,
+                quality_toggle,
+                cfg_rescale,
                 input_images,
                 mask,
                 out_dir,
@@ -730,6 +836,15 @@ def _submit_callback(config: AppConfig, gr):
         output_format: str,
         quality: str,
         background: str,
+        negative_prompt: str,
+        steps: int | float,
+        scale: int | float,
+        seed: int | float,
+        sampler: str,
+        noise_schedule: str,
+        uc_preset: int | float,
+        quality_toggle: bool,
+        cfg_rescale: int | float,
         input_images: str,
         mask: str,
         out_dir: str,
@@ -743,6 +858,7 @@ def _submit_callback(config: AppConfig, gr):
         try:
             params = _params_from_form(
                 config,
+                provider_id=provider_id,
                 extra_params=extra_params,
                 size=size,
                 aspect_ratio=aspect_ratio,
@@ -751,8 +867,17 @@ def _submit_callback(config: AppConfig, gr):
                 output_format=output_format,
                 quality=quality,
                 background=background,
+                negative_prompt=negative_prompt,
+                steps=steps,
+                scale=scale,
+                seed=seed,
+                sampler=sampler,
+                noise_schedule=noise_schedule,
+                uc_preset=uc_preset,
+                quality_toggle=quality_toggle,
+                cfg_rescale=cfg_rescale,
             )
-            final_prompt = _render_prompt_for_template(config, text, params, max(1, int(count or 1)), template_id, lang)
+            final_prompt = apply_prompt_template(config, text, params, max(1, int(count or 1)), template_id=template_id)
         except ValueError as exc:
             raise gr.Error(str(exc)) from exc
 
@@ -793,12 +918,24 @@ def _preview_callback(config: AppConfig, gr):
     def preview_prompt(
         prompt: str,
         template_id: str,
+        provider_id: str,
         count: int | float,
         size: str,
         aspect_ratio: str,
         size_tier: str,
+        model: str,
         output_format: str,
         quality: str,
+        background: str,
+        negative_prompt: str,
+        steps: int | float,
+        scale: int | float,
+        seed: int | float,
+        sampler: str,
+        noise_schedule: str,
+        uc_preset: int | float,
+        quality_toggle: bool,
+        cfg_rescale: int | float,
         extra_params: str,
         lang: str,
     ):
@@ -809,16 +946,26 @@ def _preview_callback(config: AppConfig, gr):
         try:
             params = _params_from_form(
                 config,
+                provider_id=provider_id,
                 extra_params=extra_params,
                 size=size,
                 aspect_ratio=aspect_ratio,
                 size_tier=size_tier,
-                model="",
+                model=model,
                 output_format=output_format,
                 quality=quality,
-                background="",
+                background=background,
+                negative_prompt=negative_prompt,
+                steps=steps,
+                scale=scale,
+                seed=seed,
+                sampler=sampler,
+                noise_schedule=noise_schedule,
+                uc_preset=uc_preset,
+                quality_toggle=quality_toggle,
+                cfg_rescale=cfg_rescale,
             )
-            final_prompt = _render_prompt_for_template(config, text, params, max(1, int(count or 1)), template_id, lang)
+            final_prompt = apply_prompt_template(config, text, params, max(1, int(count or 1)), template_id=template_id)
         except ValueError as exc:
             raise gr.Error(str(exc)) from exc
         return final_prompt, final_prompt, ""
@@ -839,15 +986,19 @@ def _refresh_callback(config: AppConfig):
 
 
 def _provider_change_callback(config: AppConfig, gr):
-    def provider_info(provider_id: str, lang: str):
-        return _provider_markdown(config, provider_id, _lang(lang)), gr.update(value=provider_id or "")
-
-    return provider_info
-
-
-def _provider_catalog_change_callback(config: AppConfig, gr):
-    def provider_info(provider_id: str, lang: str):
-        return gr.update(value=provider_id or ""), _provider_markdown(config, provider_id, _lang(lang))
+    def provider_info(provider_id: str, lang: str, model: str):
+        lang = _lang(lang)
+        model_choices = _model_choices(config, provider_id, lang)
+        model_values = {str(value) for _, value in model_choices}
+        model_value = str(model or "")
+        if model_value and model_value not in model_values:
+            model_choices.append((model_value, model_value))
+        return (
+            _provider_markdown(config, provider_id, lang),
+            gr.update(choices=model_choices, value=model_value),
+            gr.update(visible=is_openai_like_provider(config, provider_id)),
+            gr.update(visible=is_nai_like_provider(config, provider_id)),
+        )
 
     return provider_info
 
@@ -875,7 +1026,7 @@ def _template_sample_preview_callback(config: AppConfig, gr):
         if not text:
             raise gr.Error(_t(lang, "notice_missing_prompt"))
         try:
-            return _render_prompt_for_template(config, text, {}, 1, template_id, lang)
+            return apply_prompt_template(config, text, {}, 1, template_id=template_id)
         except ValueError as exc:
             raise gr.Error(str(exc)) from exc
 
@@ -927,19 +1078,21 @@ def _cancel_callback(config: AppConfig):
 
 
 def _language_callback(config: AppConfig, gr):
-    def change_language(lang: str, provider_id: str, template_id: str):
+    def change_language(lang: str, provider_id: str, template_id: str, model_id: str):
         lang = _lang(lang)
         provider_value = provider_id or ""
         template_value = template_id or TEMPLATE_DEFAULT
+        model_value = model_id or ""
         return (
             _topbar_html(config, lang),
             _worker_markdown(config, lang),
             gr.update(label=_t(lang, "provider"), choices=_provider_choices(config, lang), value=provider_value),
-            gr.update(label=_t(lang, "provider"), choices=_provider_choices(config, lang), value=provider_value),
+            gr.update(label=_t(lang, "model"), info=_t(lang, "model_info"), choices=_model_choices(config, provider_value, lang), value=model_value),
             gr.update(label=_t(lang, "template"), choices=_template_choices(config, lang), value=template_value),
             gr.update(label=_t(lang, "template"), choices=_template_choices(config, lang), value=template_value),
             _provider_markdown(config, provider_value, lang),
             _config_markdown(config, lang),
+            f"### {_t(lang, 'context')}\n{_t(lang, 'context_info')}",
             f"## {_t(lang, 'create_tab')}",
             f"## {_t(lang, 'generation')}",
             f"## {_t(lang, 'template_list')}",
@@ -951,10 +1104,18 @@ def _language_callback(config: AppConfig, gr):
             gr.update(label=_t(lang, "size_tier")),
             gr.update(label=_t(lang, "size")),
             gr.update(label=_t(lang, "aspect_ratio")),
-            gr.update(label=_t(lang, "model")),
             gr.update(label=_t(lang, "output_format")),
             gr.update(label=_t(lang, "quality")),
             gr.update(label=_t(lang, "background")),
+            gr.update(label=_t(lang, "negative_prompt"), info=_t(lang, "negative_prompt_info")),
+            gr.update(label=_t(lang, "steps")),
+            gr.update(label=_t(lang, "scale")),
+            gr.update(label=_t(lang, "seed")),
+            gr.update(label=_t(lang, "sampler")),
+            gr.update(label=_t(lang, "noise_schedule")),
+            gr.update(label=_t(lang, "uc_preset")),
+            gr.update(label=_t(lang, "quality_toggle")),
+            gr.update(label=_t(lang, "cfg_rescale")),
             gr.update(label=_t(lang, "out_prefix")),
             gr.update(label=_t(lang, "out_dir")),
             gr.update(label=_t(lang, "input_images"), info=_t(lang, "input_images_info")),
@@ -1019,6 +1180,12 @@ def _provider_choices(config: AppConfig, lang: str = "zh") -> list[tuple[str, st
     return choices
 
 
+def _model_choices(config: AppConfig, provider_id: str | None, lang: str = "zh") -> list[tuple[str, str]]:
+    choices = [(_t(lang, "default_provider"), "")]
+    choices.extend((model, model) for model in provider_model_choices(config, provider_id))
+    return choices
+
+
 def _provider_rows(config: AppConfig) -> list[list[Any]]:
     rows: list[list[Any]] = []
     for provider in sorted(config.providers, key=lambda item: (item.priority, item.id)):
@@ -1080,10 +1247,12 @@ def _provider_markdown(config: AppConfig, provider_id: str, lang: str = "zh") ->
     direct = ", ".join(f"`{item}`" for item in support.get("direct_cli_params") or []) or "none"
     extra = ", ".join(f"`{item}`" for item in support.get("extra_params_via_param") or []) or "none"
     ignored = ", ".join(f"`{item}`" for item in support.get("ignored_params") or []) or "none"
+    models = ", ".join(f"`{item}`" for item in provider_model_choices(config, provider.id)) or "none"
     notes = "\n".join(f"- {note}" for note in support.get("notes") or [])
     return (
         f"**{provider.id}** · `{provider.type}` · {_t(lang, 'enabled')}=`{provider.enabled}` · "
         f"{_t(lang, 'capabilities')}={list(provider.capabilities)}\n\n"
+        f"**{_t(lang, 'model')}:** {models}\n\n"
         f"**{_t(lang, 'provider_direct')}:** {direct}\n\n"
         f"**{_t(lang, 'provider_extra')}:** {extra}\n\n"
         f"**{_t(lang, 'provider_ignored')}:** {ignored}\n\n"
@@ -1106,50 +1275,14 @@ def _template_body(config: AppConfig, template_id: str, lang: str = "zh") -> str
     return f"{header}{template.body}"
 
 
-def _render_prompt_for_template(
-    config: AppConfig,
-    raw_prompt: str,
-    params: dict[str, Any],
-    count: int,
-    template_id: str,
-    lang: str = "zh",
-) -> str:
-    selected = _selected_template_id(config, template_id)
-    if selected is None:
-        return raw_prompt
-    template = config.prompt_template_map().get(selected)
-    if template is None or not template.enabled:
-        raise ValueError(_t(lang, "disabled_template"))
-    return render_prompt_template(
-        template.body,
-        prompt=raw_prompt,
-        params=_params_for_prompt_render(config, params, count),
-    )
-
-
 def _selected_template_id(config: AppConfig, template_id: str | None) -> str | None:
-    value = str(template_id or TEMPLATE_DEFAULT)
-    if value == TEMPLATE_NONE:
-        return None
-    if value == TEMPLATE_DEFAULT:
-        return config.defaults.prompt_template
-    return value
-
-
-def _params_for_prompt_render(config: AppConfig, params: dict[str, Any], count: int) -> dict[str, Any]:
-    return {
-        "size": config.defaults.size,
-        "quality": config.defaults.quality,
-        "output_format": config.defaults.output_format,
-        "moderation": config.defaults.moderation,
-        **params,
-        "n": count,
-    }
+    return core_selected_template_id(config, template_id)
 
 
 def _params_from_form(
     config: AppConfig,
     *,
+    provider_id: str | None = None,
     extra_params: str,
     size: str,
     aspect_ratio: str,
@@ -1158,21 +1291,37 @@ def _params_from_form(
     output_format: str,
     quality: str,
     background: str,
+    negative_prompt: str = "",
+    steps: Any = None,
+    scale: Any = None,
+    seed: Any = None,
+    sampler: str = "",
+    noise_schedule: str = "",
+    uc_preset: Any = None,
+    quality_toggle: Any = None,
+    cfg_rescale: Any = None,
 ) -> dict[str, Any]:
-    params = _parse_extra_params(extra_params)
-    if str(size or "").strip():
-        params["size"] = str(size).strip()
-    elif str(aspect_ratio or "").strip():
-        params["size"] = _size_from_aspect_ratio(str(aspect_ratio), str(size_tier or "1K"))
-    for key, value in {
-        "model": model,
-        "output_format": output_format,
-        "quality": quality,
-        "background": background,
-    }.items():
-        if str(value or "").strip():
-            params[key] = str(value).strip()
-    return params
+    return build_job_params(
+        config,
+        provider_id=provider_id,
+        extra_params=extra_params,
+        size=size,
+        aspect_ratio=aspect_ratio,
+        size_tier=size_tier,
+        model=model,
+        output_format=output_format,
+        quality=quality,
+        background=background,
+        negative_prompt=negative_prompt,
+        steps=steps,
+        scale=scale,
+        seed=seed,
+        sampler=sampler,
+        noise_schedule=noise_schedule,
+        uc_preset=uc_preset,
+        quality_toggle=quality_toggle,
+        cfg_rescale=cfg_rescale,
+    )
 
 
 def _job_rows(config: AppConfig, *, limit: int = 20, status: str | None = None) -> list[list[Any]]:
@@ -1286,19 +1435,6 @@ def _worker_markdown(config: AppConfig, lang: str = "zh") -> str:
     return f"**{_t(lang, 'worker')}:** `{state}` · {_t(lang, 'worker_pid')} `{pid}` · {_t(lang, 'worker_age')} `{age_text}`"
 
 
-def _parse_extra_params(value: str) -> dict[str, Any]:
-    text = str(value or "").strip()
-    if not text:
-        return {}
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Extra params must be a JSON object: {exc.msg}") from exc
-    if not isinstance(parsed, dict):
-        raise ValueError("Extra params must be a JSON object.")
-    return dict(parsed)
-
-
 def _path_lines(value: str) -> list[str]:
     return [line.strip() for line in str(value or "").splitlines() if line.strip()]
 
@@ -1315,38 +1451,6 @@ def _shorten(value: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)] + "…"
-
-
-def _size_from_aspect_ratio(value: str, tier: str) -> str:
-    ratio = _parse_ratio(value)
-    if not ratio:
-        return "1024x1024"
-    rw, rh = ratio
-    tier = str(tier or "1K").upper()
-    if rw == rh:
-        side = 1024 if tier == "1K" else 2048 if tier == "2K" else 3840
-        return f"{side}x{side}"
-    long_side = 1024 if tier == "1K" else 2048 if tier == "2K" else 3840
-    if rw > rh:
-        return f"{long_side}x{max(64, int(round(long_side * rh / rw)))}"
-    return f"{max(64, int(round(long_side * rw / rh)))}x{long_side}"
-
-
-def _parse_ratio(value: str) -> tuple[float, float] | None:
-    text = value.strip().lower().replace(" ", "")
-    aliases = {"square": "1:1", "landscape": "3:2", "portrait": "2:3"}
-    text = aliases.get(text, text)
-    for separator in (":", "x", "×"):
-        if separator in text:
-            left, right = text.split(separator, 1)
-            try:
-                rw = float(left)
-                rh = float(right)
-            except ValueError:
-                return None
-            if rw > 0 and rh > 0:
-                return rw, rh
-    return None
 
 
 def _lang(lang: str | None) -> str:

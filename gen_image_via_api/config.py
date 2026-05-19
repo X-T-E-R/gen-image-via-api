@@ -39,6 +39,7 @@ class PromptTemplateConfig:
     id: str
     name: str = ""
     body: str = ""
+    params: dict[str, Any] = field(default_factory=dict)
     enabled: bool = True
 
 
@@ -104,6 +105,7 @@ class ProviderConfig:
     type: str
     base_url: str = ""
     model: str = ""
+    models: tuple[str, ...] = ()
     enabled: bool = True
     priority: int = 100
     capabilities: tuple[str, ...] = ("generate", "edit")
@@ -287,6 +289,7 @@ def _load_provider(raw: dict[str, Any], index: int, defaults: DefaultsConfig, ba
         type=provider_type,
         base_url=str(raw.get("base_url") or file_site or ""),
         model=str(raw.get("model") or ""),
+        models=_as_str_tuple(raw.get("models"), ()),
         enabled=bool(raw.get("enabled", True)),
         priority=_as_int(raw.get("priority"), 100, minimum=-1_000_000),
         capabilities=_as_str_tuple(raw.get("capabilities"), ("generate", "edit")),
@@ -334,6 +337,7 @@ def _load_prompt_template(raw: Any, index: int, fallback_id: str | None = None) 
         id=template_id,
         name=str(raw.get("name") or template_id),
         body=str(raw.get("body") or ""),
+        params=dict(raw.get("params") or {}),
         enabled=_as_bool(raw.get("enabled"), True),
     )
 
@@ -533,6 +537,14 @@ name = "Cinematic wrapper"
 enabled = false
 body = "Style: cinematic, high detail.\\n\\n{{prompt}}\\n\\nRequested size: {{size}} ({{ratio}})."
 
+[[prompt_templates]]
+id = "nai-safe-negative"
+name = "NAI safe negative prompt"
+enabled = false
+body = "${prompt}"
+[prompt_templates.params]
+negative_prompt = "blurry, lowres, error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, multiple views, logo, too many watermarks, tiara, coat, futa, poorly drawn, lowers, blurry, bokeh, worst quality, low quality, out of focus, ugly, error, jpeg artifacts, {{{{censor, bar censor}}}}, mosaic censorship, puffy nipples, extra digits, POV hands, hutanari, worst quality, low quality:1.4), lowres, text, bad anatomy, text, logo, watermark, extra fingers, missing fingers, extra arms, missing arms, extra legs, extra legs, counter, body writing"
+
 [send]
 # Optional adapter used by `generate --send`, `once --send`, and `send`.
 # Set preset = "hermes" for Hermes Agent's messaging tool, or
@@ -638,6 +650,7 @@ id = "idlecloud"
 type = "idlecloud"
 base_url = "https://api.idlecloud.cc/api"
 model = "nai-diffusion-4-5-full"
+models = ["nai-diffusion-3", "nai-diffusion-4-full", "nai-diffusion-4-5-full"]
 enabled = false
 priority = 15
 capabilities = ["generate", "edit"]
@@ -663,6 +676,7 @@ id = "nai-idlecloud"
 type = "nai"
 base_url = "https://api.idlecloud.cc/api"
 model = "nai-diffusion-4-5-full"
+models = ["nai-diffusion-3", "nai-diffusion-4-full", "nai-diffusion-4-5-full"]
 enabled = false
 priority = 16
 capabilities = ["generate", "edit"]

@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from gen_image_via_api.config import load_config
 import gen_image_via_api.config as config_mod
+from gen_image_via_api.generation import apply_prompt_template, build_job_params, provider_model_choices
 from gen_image_via_api.prompting import (
     PROMPT_REWRITE_GUARD_PREFIX,
     append_size_instruction,
@@ -22,7 +23,6 @@ from gen_image_via_api.webui import (
     MISSING_WEBUI_DEPS_MESSAGE,
     TEMPLATE_DEFAULT,
     TEMPLATE_NONE,
-    _render_prompt_for_template,
     _status_choices,
     _tab_label,
     _template_body,
@@ -48,6 +48,15 @@ class PromptingAndConfigTests(unittest.TestCase):
         )
 
         self.assertEqual(rendered, "Style: cinematic | 1536x1024 | 3:2 | high | webp | 2\n\na city")
+
+    def test_prompt_template_preserves_nai_weight_braces_and_supports_dollar_placeholders(self) -> None:
+        rendered = render_prompt_template(
+            "{{{best quality}}}, ${prompt}, {{unknown}}",
+            prompt="1girl",
+            params={},
+        )
+
+        self.assertEqual(rendered, "{{{best quality}}}, 1girl, {{unknown}}")
 
     def test_append_size_instruction_is_idempotent(self) -> None:
         prompt = append_size_instruction("draw", "1536x1024")
@@ -183,7 +192,7 @@ type = "mock"
         self.assertEqual(code, 2)
         self.assertIn(MISSING_WEBUI_DEPS_MESSAGE, stderr.getvalue())
 
-    def test_webui_template_helpers_support_default_none_and_bilingual_labels(self) -> None:
+    def test_template_helpers_support_default_none_params_models_and_bilingual_labels(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             config = root / "gen-image.toml"
@@ -195,7 +204,9 @@ prompt_template = "wrap"
 [[prompt_templates]]
 id = "wrap"
 name = "Wrapper"
-body = "Wrap {{n}} {{size}} {{prompt}}"
+body = "Wrap ${n} ${size} ${prompt}"
+[prompt_templates.params]
+negative_prompt = "blurry, ${prompt}, {{{{censor}}}}"
 
 [[prompt_templates]]
 id = "disabled"
@@ -204,7 +215,13 @@ body = "disabled"
 
 [[providers]]
 id = "p"
-type = "mock"
+type = "idlecloud"
+model = "nai-diffusion-4-5-full"
+models = ["custom-model"]
+
+[[providers.keys]]
+id = "k"
+api_key = "secret"
 """.strip(),
                 encoding="utf-8",
             )
@@ -218,11 +235,21 @@ type = "mock"
         self.assertIn(("Wrapper · wrap", "wrap"), zh_choices)
         self.assertNotIn(("disabled · disabled", "disabled"), zh_choices)
         self.assertIn("Wrapper", _template_body(app, TEMPLATE_DEFAULT, "zh"))
+        params: dict[str, object] = {"size": "1536x1024"}
         self.assertEqual(
-            _render_prompt_for_template(app, "a fox", {"size": "1536x1024"}, 2, TEMPLATE_DEFAULT, "en"),
+            apply_prompt_template(app, "a fox", params, 2, template_id=TEMPLATE_DEFAULT),
             "Wrap 2 1536x1024 a fox",
         )
-        self.assertEqual(_render_prompt_for_template(app, "raw", {}, 1, TEMPLATE_NONE, "en"), "raw")
+        self.assertEqual(params["negative_prompt"], "blurry, a fox, {{{{censor}}}}")
+        self.assertEqual(app.prompt_templates[0].params["negative_prompt"], "blurry, ${prompt}, {{{{censor}}}}")
+        self.assertIn("custom-model", provider_model_choices(app, "p"))
+        self.assertIn("nai-diffusion-4-5-full", provider_model_choices(app, "p"))
+        self.assertEqual(app.providers[0].models, ("custom-model",))
+        self.assertEqual(apply_prompt_template(app, "raw", {}, 1, template_id=TEMPLATE_NONE), "raw")
+        self.assertEqual(
+            build_job_params(app, provider_id="p", negative_prompt="bad", steps=28, scale=5, seed=0)["negative_prompt"],
+            "bad",
+        )
         self.assertEqual(_status_choices("en")[0], ("All statuses", ""))
         self.assertEqual(_tab_label("create_tab"), "创作 / Create")
 

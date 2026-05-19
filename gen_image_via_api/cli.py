@@ -12,24 +12,16 @@ from typing import Any
 
 from .config import DEFAULT_CONFIG_NAME, ConfigError, load_config, resolve_config_path, write_example_config
 from .delivery import SendError, send_paths
+from .generation import (
+    apply_prompt_template,
+    normalize_image_size,
+    size_from_aspect_ratio,
+)
 from .provider_support import COMMON_DIRECT_CLI_PARAMS, provider_parameter_support
 from .queue import ImageQueue, JobRecord
-from .prompting import render_prompt_template
 from .service import ensure_worker, serve_forever, stop_worker, worker_status
 from .worker import Worker, run_queue
 from .webui import serve_webui
-
-
-RATIO_ALIASES = {
-    "square": "1:1",
-    "landscape": "3:2",
-    "portrait": "2:3",
-}
-SIZE_MULTIPLE = 16
-MAX_EDGE = 3840
-MAX_ASPECT_RATIO = 3
-MIN_PIXELS = 655_360
-MAX_PIXELS = 8_294_400
 
 
 def _read_prompt(prompt: str | None, prompt_file: str | None) -> str:
@@ -91,17 +83,6 @@ def _params_from_job_args(args: argparse.Namespace) -> dict[str, Any]:
     return params
 
 
-def _params_for_prompt_render(config, params: dict[str, Any], count: int) -> dict[str, Any]:
-    return {
-        "size": config.defaults.size,
-        "quality": config.defaults.quality,
-        "output_format": config.defaults.output_format,
-        "moderation": config.defaults.moderation,
-        **params,
-        "n": count,
-    }
-
-
 def _render_prompt_with_template(
     config,
     raw_prompt: str,
@@ -113,17 +94,10 @@ def _render_prompt_with_template(
 ) -> str:
     if no_template:
         return raw_prompt
-    selected = template_id or config.defaults.prompt_template
-    if not selected:
-        return raw_prompt
-    template = config.prompt_template_map().get(selected)
-    if not template or not template.enabled:
-        raise SystemExit(f"Unknown or disabled prompt template: {selected}")
-    return render_prompt_template(
-        template.body,
-        prompt=raw_prompt,
-        params=_params_for_prompt_render(config, params, count),
-    )
+    try:
+        return apply_prompt_template(config, raw_prompt, params, count, template_id=template_id)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _prompt_from_job_args(config, args: argparse.Namespace, params: dict[str, Any]) -> str:
@@ -139,105 +113,14 @@ def _prompt_from_job_args(config, args: argparse.Namespace, params: dict[str, An
 
 
 def _size_from_aspect_ratio(value: str, tier: str) -> str:
-    return _calculate_image_size(tier, value)
-
-
-def _parse_ratio(value: str) -> tuple[float, float] | None:
-    normalized = RATIO_ALIASES.get(value.strip().lower().replace(" ", ""), value.strip().lower().replace(" ", ""))
-    for separator in (":", "x", "×"):
-        if separator in normalized:
-            left, right = normalized.split(separator, 1)
-            try:
-                width = float(left)
-                height = float(right)
-            except ValueError:
-                return None
-            if width > 0 and height > 0:
-                return width, height
-    return None
-
-
-def _round_multiple(value: float, multiple: int = SIZE_MULTIPLE) -> int:
-    return max(multiple, int(round(value / multiple)) * multiple)
-
-
-def _floor_multiple(value: float, multiple: int = SIZE_MULTIPLE) -> int:
-    return max(multiple, int(value // multiple) * multiple)
-
-
-def _ceil_multiple(value: float, multiple: int = SIZE_MULTIPLE) -> int:
-    import math
-
-    return max(multiple, int(math.ceil(value / multiple)) * multiple)
-
-
-def _normalize_dimensions(width: float, height: float) -> tuple[int, int]:
-    import math
-
-    normalized_width = _round_multiple(width)
-    normalized_height = _round_multiple(height)
-
-    for _ in range(4):
-        max_edge = max(normalized_width, normalized_height)
-        if max_edge > MAX_EDGE:
-            scale = MAX_EDGE / max_edge
-            normalized_width = _floor_multiple(normalized_width * scale)
-            normalized_height = _floor_multiple(normalized_height * scale)
-
-        if normalized_width / normalized_height > MAX_ASPECT_RATIO:
-            normalized_width = _floor_multiple(normalized_height * MAX_ASPECT_RATIO)
-        elif normalized_height / normalized_width > MAX_ASPECT_RATIO:
-            normalized_height = _floor_multiple(normalized_width * MAX_ASPECT_RATIO)
-
-        pixels = normalized_width * normalized_height
-        if pixels > MAX_PIXELS:
-            scale = math.sqrt(MAX_PIXELS / pixels)
-            normalized_width = _floor_multiple(normalized_width * scale)
-            normalized_height = _floor_multiple(normalized_height * scale)
-        elif pixels < MIN_PIXELS:
-            scale = math.sqrt(MIN_PIXELS / pixels)
-            normalized_width = _ceil_multiple(normalized_width * scale)
-            normalized_height = _ceil_multiple(normalized_height * scale)
-
-    return normalized_width, normalized_height
+    try:
+        return size_from_aspect_ratio(value, tier)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _normalize_image_size(value: str) -> str:
-    trimmed = value.strip()
-    if trimmed.lower() == "auto":
-        return "auto"
-    for separator in ("x", "X", "×"):
-        if separator in trimmed:
-            left, right = trimmed.split(separator, 1)
-            if left.strip().isdigit() and right.strip().isdigit():
-                width, height = _normalize_dimensions(float(left), float(right))
-                return f"{width}x{height}"
-    return trimmed
-
-
-def _calculate_image_size(tier: str, ratio: str) -> str:
-    parsed = _parse_ratio(ratio)
-    if not parsed:
-        raise SystemExit("Unsupported --aspect-ratio. Use values like 1:1, 4:3, 3:2, 16:9, 9:16, or 21:9.")
-    ratio_width, ratio_height = parsed
-    normalized_tier = str(tier or "1K").upper()
-    if normalized_tier not in {"1K", "2K", "4K"}:
-        raise SystemExit("--size-tier must be one of: 1K, 2K, 4K")
-
-    if ratio_width == ratio_height:
-        side = 1024 if normalized_tier == "1K" else 2048 if normalized_tier == "2K" else 3840
-        return _normalize_image_size(f"{side}x{side}")
-
-    if normalized_tier == "1K":
-        short_side = 1024
-        width = _round_multiple(short_side * ratio_width / ratio_height) if ratio_width > ratio_height else short_side
-        height = short_side if ratio_width > ratio_height else _round_multiple(short_side * ratio_height / ratio_width)
-        return f"{width}x{height}"
-
-    long_side = 2048 if normalized_tier == "2K" else 3840
-    width = long_side if ratio_width > ratio_height else _round_multiple(long_side * ratio_width / ratio_height)
-    height = _round_multiple(long_side * ratio_height / ratio_width) if ratio_width > ratio_height else long_side
-    return _normalize_image_size(f"{width}x{height}")
+    return normalize_image_size(value)
 
 
 def _params_from_batch_item(item: dict[str, Any]) -> dict[str, Any]:

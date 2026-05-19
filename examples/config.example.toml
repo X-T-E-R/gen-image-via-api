@@ -25,6 +25,14 @@ name = "Cinematic wrapper"
 enabled = false
 body = "Style: cinematic, high detail.\n\n{{prompt}}\n\nRequested size: {{size}} ({{ratio}})."
 
+[[prompt_templates]]
+id = "nai-safe-negative"
+name = "NAI safe negative prompt"
+enabled = false
+body = "${prompt}"
+[prompt_templates.params]
+negative_prompt = "blurry, lowres, error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, multiple views, logo, too many watermarks, tiara, coat, futa, poorly drawn, lowers, blurry, bokeh, worst quality, low quality, out of focus, ugly, error, jpeg artifacts, {{{{censor, bar censor}}}}, mosaic censorship, puffy nipples, extra digits, POV hands, hutanari, worst quality, low quality:1.4), lowres, text, bad anatomy, text, logo, watermark, extra fingers, missing fingers, extra arms, missing arms, extra legs, extra legs, counter, body writing"
+
 [send]
 # Optional adapter used by `generate --send`, `once --send`, and `send`.
 # Set preset = "hermes" for Hermes Agent's messaging tool, or
@@ -117,6 +125,7 @@ id = "idlecloud"
 type = "idlecloud"
 base_url = "https://api.idlecloud.cc/api"
 model = "nai-diffusion-4-5-full"
+models = ["nai-diffusion-3", "nai-diffusion-4-full", "nai-diffusion-4-5-full"]
 enabled = false
 priority = 15
 capabilities = ["generate", "edit"]
@@ -142,6 +151,7 @@ id = "nai-idlecloud"
 type = "nai"
 base_url = "https://api.idlecloud.cc/api"
 model = "nai-diffusion-4-5-full"
+models = ["nai-diffusion-3", "nai-diffusion-4-full", "nai-diffusion-4-5-full"]
 enabled = false
 priority = 16
 capabilities = ["generate", "edit"]
